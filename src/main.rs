@@ -88,6 +88,7 @@ fn run_scan() -> String {
                 ("runningContainers", Json::Uint(containers.running_count as u64)),
                 ("failedServices", Json::Uint(services.failed_count as u64)),
                 ("kubeProd", Json::Bool(kube.current_is_prod)),
+                ("kubeUnknown", Json::Bool(kube.target_unknown)),
                 ("kubeContext", Json::s(kube.current_context.clone())),
                 ("internetConns", Json::Uint(traffic.internet_conns as u64)),
                 ("securityCritical", Json::Uint(security.critical_count as u64)),
@@ -153,7 +154,9 @@ fn print_human_status(show_all: bool) {
         traffic.internet_conns
     );
 
-    if kube.available {
+    if kube.target_unknown {
+        println!("K8s: UNKNOWN TARGET ({})", kube.warning_detail);
+    } else if kube.available {
         let warn = if kube.current_is_prod { " [PROD!]" } else { "" };
         println!("K8s: {} (ns: {}){}", kube.current_context, kube.current_namespace, warn);
     }
@@ -227,9 +230,10 @@ fn print_net_status() {
     let sec = SecurityState::collect(&ports, &traffic);
 
     println!(
-        "OS Security Posture: {}/{} PASS  ({} warn, {} fail)",
+        "OS Security Posture: {}/{} PASS  ({} info, {} warn, {} fail)",
         sec.pass_count,
         sec.checks.len(),
+        sec.info_count,
         sec.warn_count,
         sec.fail_count
     );

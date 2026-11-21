@@ -1,6 +1,6 @@
 .pragma library
 
-var EXPECTED_SOURCE_SHA256 = "d33afcc3c875141b953c72410453297079aa4cd2d4768c46f7d1c542d097973e"
+var EXPECTED_SOURCE_SHA256 = "b41d890e235db541294b1c59c790ea8a8e70379d1528985d16518f81035a60ec"
 
 function emptySnapshot() {
   return {
@@ -12,6 +12,7 @@ function emptySnapshot() {
       runningContainers: 0,
       failedServices: 0,
       kubeProd: false,
+      kubeUnknown: false,
       kubeContext: "",
       internetConns: 0,
       securityCritical: 0,
@@ -45,6 +46,8 @@ function emptySnapshot() {
     },
     kube: {
       available: false,
+      targetUnknown: false,
+      warningDetail: "",
       currentContext: "",
       currentNamespace: "",
       currentIsProd: false,
@@ -70,6 +73,7 @@ function emptySnapshot() {
     },
     security: {
       passCount: 0,
+      infoCount: 0,
       warnCount: 0,
       failCount: 0,
       criticalCount: 0,
@@ -124,6 +128,7 @@ function parseSnapshot(raw) {
       base.summary.runningContainers = Number(data.summary.runningContainers || 0)
       base.summary.failedServices = Number(data.summary.failedServices || 0)
       base.summary.kubeProd = data.summary.kubeProd === true
+      base.summary.kubeUnknown = data.summary.kubeUnknown === true
       base.summary.kubeContext = String(data.summary.kubeContext || "")
       base.summary.internetConns = Number(data.summary.internetConns || 0)
       base.summary.securityCritical = Number(data.summary.securityCritical || 0)
@@ -157,6 +162,8 @@ function parseSnapshot(raw) {
     }
     if (data.kube && typeof data.kube === "object") {
       base.kube.available = data.kube.available === true
+      base.kube.targetUnknown = data.kube.targetUnknown === true
+      base.kube.warningDetail = String(data.kube.warningDetail || "")
       base.kube.currentContext = String(data.kube.currentContext || "")
       base.kube.currentNamespace = String(data.kube.currentNamespace || "")
       base.kube.currentIsProd = data.kube.currentIsProd === true
@@ -182,6 +189,7 @@ function parseSnapshot(raw) {
     }
     if (data.security && typeof data.security === "object") {
       base.security.passCount = Number(data.security.passCount || 0)
+      base.security.infoCount = Number(data.security.infoCount || 0)
       base.security.warnCount = Number(data.security.warnCount || 0)
       base.security.failCount = Number(data.security.failCount || 0)
       base.security.criticalCount = Number(data.security.criticalCount || 0)
@@ -462,9 +470,11 @@ function barLabel(summary, binaryMissing) {
   var failed = Number(s.failedServices || 0)
   var crit = Number(s.securityCritical || 0)
   var prod = s.kubeProd === true
+  var kUnknown = s.kubeUnknown === true
 
   var parts = []
   if (prod) parts.push("PROD")
+  else if (kUnknown) parts.push("K8s?")
   if (crit > 0) parts.push("SEC!" + crit)
   if (failed > 0) parts.push("!" + failed)
   if (ports > 0) parts.push(String(ports))
@@ -476,7 +486,7 @@ function barLabel(summary, binaryMissing) {
 
 function barUrgent(summary) {
   var s = summary || {}
-  return s.kubeProd === true || Number(s.failedServices || 0) > 0 || Number(s.securityCritical || 0) > 0
+  return s.kubeProd === true || s.kubeUnknown === true || Number(s.failedServices || 0) > 0 || Number(s.securityCritical || 0) > 0
 }
 
 function barActive(summary) {
@@ -493,7 +503,9 @@ function barTooltip(summary, host, binaryMissing) {
   if (Number(s.tunnels || 0) > 0) parts.push(s.tunnels + " tunnels")
   if (Number(s.runningContainers || 0) > 0) parts.push(s.runningContainers + " containers")
   if (Number(s.internetConns || 0) > 0) parts.push(s.internetConns + " net conns")
-  if (String(s.kubeContext || "") !== "") {
+  if (s.kubeUnknown === true) {
+    parts.push("K8s: TARGET UNKNOWN")
+  } else if (String(s.kubeContext || "") !== "") {
     parts.push("K8s: " + s.kubeContext + (s.kubeProd ? " [PROD]" : ""))
   }
   if (Number(s.securityCritical || 0) > 0) parts.push(s.securityCritical + " security alert(s)")

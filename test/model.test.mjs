@@ -130,6 +130,17 @@ test("parseSnapshot parses valid Rust scan payload", () => {
   assert.equal(Model.filterPorts(res.data.ports, "web", "nomatch").length, 0);
   assert.equal(Model.barUrgent(res.data.summary), true);
   assert.equal(Model.barLabel(res.data.summary, false), "PROD · 2 · ⇄1");
+
+  const unk = Model.parseSnapshot(JSON.stringify({
+    summary: { kubeUnknown: true, devPorts: 1 },
+    kube: { available: true, targetUnknown: true, warningDetail: "invalid json" },
+    security: { passCount: 10, infoCount: 1, warnCount: 0, failCount: 0, checks: [] }
+  }));
+  assert.equal(unk.ok, true);
+  assert.equal(unk.data.kube.targetUnknown, true);
+  assert.equal(unk.data.security.infoCount, 1);
+  assert.equal(Model.barUrgent(unk.data.summary), true);
+  assert.equal(Model.barLabel(unk.data.summary, false), "K8s? · 1");
 });
 
 test("parseSnapshot rejects empty or invalid JSON safely", () => {

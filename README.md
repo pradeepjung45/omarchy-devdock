@@ -27,10 +27,10 @@ Powered by a single ~720 KB native Rust binary compiled strictly against `std` (
 ### 3. Live Internet Traffic & OS Security Radar (`3`)
 - **Live Throughput HUD**: Real-time `↓ RX / ↑ TX` rates from `/proc/net/dev` across Wi-Fi, Ethernet, VPN, and Docker bridges.
 - **Process-Attributed Connections**: Maps every active `ESTABLISHED` / `SYN` internet & LAN socket to its owning process (`comm`, `pid`, `exe`) with Inbound (`↙`) vs Outbound (`↗`), protocol tags (`HTTPS`, `HTTP`, `SSH`, `DNS`, DBs), **1-click on-demand Reverse DNS (`rDNS`)**, **Jump to Window**, safe UID-verified **Stop Process**, and **critical alerts** if a deleted or `/tmp`/`/dev/shm` binary calls the internet.
-- **11 Self-Contained OS Hardening Checks (Zero Root)**: Live systemd firewall verification (`ufw.service` / `nftables.service` / `firewalld.service`), kernel-verified LUKS dm-crypt root check (`/proc/self/mountinfo` + `/sys/class/block/*/dm/uuid`), ASLR, Yama ptrace, eBPF lock, `kptr`/`dmesg` isolation, `rp_filter`, Arch kernel-reboot drift, SSH `:22` exposure, `0.0.0.0` local DB/broker guard, and runtime traffic anomalies.
+- **11 Self-Contained OS Hardening Checks (Zero Root)**: Live systemd firewall status (distinguishing running services from root-verified filtering policies), all-branch mounted-root LUKS dm-crypt verification (`/proc/self/mountinfo` + `/sys/fs/btrfs/*/devices` + `/sys/class/block/*/slaves` + `dm/uuid`), ASLR, Yama ptrace, eBPF lock, `kptr`/`dmesg` isolation, `rp_filter`, Arch kernel-reboot drift, SSH `:22` exposure, `0.0.0.0` local DB/broker guard, and runtime traffic anomalies.
 
 ### 4. Infra — Kubernetes & Systemd (`4`)
-- Native multi-file `$KUBECONFIG` / `~/.kube/config` merger (follows kubectl merge precedence, zero network calls) with a persistent red **`PROD` context warning** on both the bar icon and popup header, 1-click context switching, and `AWS_PROFILE` badge.
+- Kubeconfig loader using `kubectl config view -o json` when available (zero network calls) with a strict native JSON + YAML multi-file `$KUBECONFIG` fallback that fails closed (`K8s?` target unknown warning) if any file cannot be safely parsed, plus a persistent red **`PROD` context warning**, 1-click context switching, and `AWS_PROFILE` badge.
 - Failed system & user systemd unit alerts + installed DevOps daemon health with 1-click `journalctl` logs.
 
 ### 5. Interactive Arch OS Architecture Map (`5`) & 16 Color Palettes (`t`)

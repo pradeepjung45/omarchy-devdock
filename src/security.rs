@@ -13,13 +13,14 @@ use crate::traffic::TrafficState;
 pub struct SecurityCheck {
     pub id: &'static str,
     pub label: &'static str,
-    pub status: &'static str, // "pass" | "warn" | "fail"
+    pub status: &'static str, // "pass" | "info" | "warn" | "fail"
     pub detail: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct SecurityState {
     pub pass_count: usize,
+    pub info_count: usize,
     pub warn_count: usize,
     pub fail_count: usize,
     pub critical_count: usize,
@@ -43,22 +44,25 @@ impl SecurityState {
         checks.push(check_runtime_traffic_threats(traffic));
 
         let pass_count = checks.iter().filter(|c| c.status == "pass").count();
+        let info_count = checks.iter().filter(|c| c.status == "info").count();
         let warn_count = checks.iter().filter(|c| c.status == "warn").count();
         let fail_count = checks.iter().filter(|c| c.status == "fail").count();
         let critical_count = traffic.critical_alerts.len() + fail_count;
 
-        // Sort issues first (fail -> warn -> pass) so risks are immediately visible
+        // Sort issues first (fail -> warn -> info -> pass) so risks & unverified items stand out
         checks.sort_by(|a, b| {
             let rank = |s: &str| match s {
                 "fail" => 0,
                 "warn" => 1,
-                _ => 2,
+                "info" => 2,
+                _ => 3,
             };
             rank(a.status).cmp(&rank(b.status))
         });
 
         Self {
             pass_count,
+            info_count,
             warn_count,
             fail_count,
             critical_count,
@@ -69,6 +73,7 @@ impl SecurityState {
     pub fn to_json(&self) -> Json {
         Json::Object(vec![
             ("passCount", Json::Uint(self.pass_count as u64)),
+            ("infoCount", Json::Uint(self.info_count as u64)),
             ("warnCount", Json::Uint(self.warn_count as u64)),
             ("failCount", Json::Uint(self.fail_count as u64)),
             ("criticalCount", Json::Uint(self.critical_count as u64)),
@@ -97,16 +102,31 @@ fn read_sysctl_u32(path: &str) -> Option<u32> {
 }
 
 fn check_firewall() -> SecurityCheck {
-    // Query live runtime state from systemd (unprivileged) rather than trusting
-    // static config files on disk when the firewall service is stopped.
+    // Query live runtime state from systemd (unprivileged). Because inspecting
+    // live kernel filtering rules (nft list ruleset / iptables / firewalld
+    // active zones) requires elevated privileges, distinguish a running
+    // firewall service ("info") from a verified filtering policy rather than
+    // reporting a false "pass".
     let states = query_firewall_services();
     let ufw_conf_enabled = fs::read_to_string("/etc/ufw/ufw.conf")
         .ok()
         .map(|raw| raw.lines().any(|l| l.trim() == "ENABLED=yes"));
+    let ufw_default_input = read_ufw_default_input_policy();
     let has_any_config = Path::new("/etc/ufw/ufw.conf").exists()
         || Path::new("/etc/nftables.conf").exists();
 
-    evaluate_firewall_state(states, ufw_conf_enabled, has_any_config)
+    evaluate_firewall_state(states, ufw_conf_enabled, ufw_default_input.as_deref(), has_any_config)
+}
+
+fn read_ufw_default_input_policy() -> Option<String> {
+    let raw = fs::read_to_string("/etc/default/ufw").ok()?;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("DEFAULT_INPUT_POLICY=") {
+            return Some(rest.trim().trim_matches(|c| c == '"' || c == '\'').to_ascii_uppercase());
+        }
+    }
+    None
 }
 
 fn query_firewall_services() -> Option<(String, String, String)> {
@@ -119,7 +139,6 @@ fn query_firewall_services() -> Option<(String, String, String)> {
     let ufw = lines.next()?;
     let nft = lines.next().unwrap_or_default();
     let fwld = lines.next().unwrap_or_default();
-    // Ignore empty output when systemd bus is unavailable (e.g. non-systemd container)
     if ufw.is_empty() && nft.is_empty() && fwld.is_empty() {
         return None;
     }
@@ -129,6 +148,7 @@ fn query_firewall_services() -> Option<(String, String, String)> {
 pub fn evaluate_firewall_state(
     service_states: Option<(String, String, String)>,
     ufw_conf_enabled: Option<bool>,
+    ufw_default_input: Option<&str>,
     has_any_config: bool,
 ) -> SecurityCheck {
     let Some((ufw, nft, fwld)) = service_states else {
@@ -142,12 +162,29 @@ pub fn evaluate_firewall_state(
 
     if ufw == "active" {
         return match ufw_conf_enabled {
-            Some(true) => SecurityCheck {
-                id: "firewall",
-                label: "Host Firewall",
-                status: "pass",
-                detail: "ufw.service active and ENABLED=yes".into(),
-            },
+            Some(true) => {
+                if ufw_default_input == Some("ACCEPT") {
+                    SecurityCheck {
+                        id: "firewall",
+                        label: "Host Firewall",
+                        status: "warn",
+                        detail: "ufw.service running, but DEFAULT_INPUT_POLICY=ACCEPT".into(),
+                    }
+                } else {
+                    let policy_note = match ufw_default_input {
+                        Some(p) => format!("DEFAULT_INPUT_POLICY={p}; "),
+                        None => String::new(),
+                    };
+                    SecurityCheck {
+                        id: "firewall",
+                        label: "Host Firewall",
+                        status: "info",
+                        detail: format!(
+                            "ufw.service running ({policy_note}live rules require root to verify)"
+                        ),
+                    }
+                }
+            }
             Some(false) => SecurityCheck {
                 id: "firewall",
                 label: "Host Firewall",
@@ -167,8 +204,8 @@ pub fn evaluate_firewall_state(
         return SecurityCheck {
             id: "firewall",
             label: "Host Firewall",
-            status: "pass",
-            detail: "nftables.service active".into(),
+            status: "info",
+            detail: "nftables.service running (live filtering policy requires root to verify)".into(),
         };
     }
 
@@ -176,8 +213,8 @@ pub fn evaluate_firewall_state(
         return SecurityCheck {
             id: "firewall",
             label: "Host Firewall",
-            status: "pass",
-            detail: "firewalld.service active".into(),
+            status: "info",
+            detail: "firewalld.service running (active zone policies require root to verify)".into(),
         };
     }
 
@@ -201,10 +238,9 @@ pub fn evaluate_firewall_state(
 }
 
 fn check_luks_encryption() -> SecurityCheck {
-    // Verify the actual mounted `/` root filesystem by resolving its backing
-    // block device from /proc/self/mountinfo and walking /sys/class/block/*/dm/uuid
-    // for a kernel dm-crypt ("CRYPT-...") UUID — never trusting /proc/cmdline or
-    // unrelated /dev/mapper/* names.
+    // Verify EVERY data-bearing backing branch of the actual mounted `/` root
+    // filesystem (including multi-device Btrfs volumes via /sys/fs/btrfs/*/devices
+    // and composite dm/LVM/RAID slave graphs via /sys/class/block/*/slaves).
     let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
         return SecurityCheck {
             id: "luks",
@@ -213,7 +249,7 @@ fn check_luks_encryption() -> SecurityCheck {
             detail: "Unable to read /proc/self/mountinfo".into(),
         };
     };
-    let Some((maj_min, source)) = extract_root_mount_source(&mountinfo) else {
+    let Some((fstype, maj_min, source)) = extract_root_mount_info(&mountinfo) else {
         return SecurityCheck {
             id: "luks",
             label: "Disk Encryption",
@@ -222,59 +258,57 @@ fn check_luks_encryption() -> SecurityCheck {
         };
     };
 
-    let Some(block_name) = resolve_block_device_name(&maj_min, &source) else {
+    let Some(primary_block) = resolve_block_device_name(&maj_min, &source) else {
+        let src_label = if source.is_empty() { fstype.as_str() } else { source.as_str() };
         return SecurityCheck {
             id: "luks",
             label: "Disk Encryption",
             status: "warn",
-            detail: format!("Root / mount source ({source}) is not a dm-crypt block device"),
+            detail: format!("Root / ({src_label}) is not a verified dm-crypt block device"),
         };
     };
 
-    let mut visited = HashSet::new();
-    if let Some((dm_dev, uuid)) = find_crypt_dm_ancestor(&block_name, &mut visited, 0) {
-        let kind = if uuid.starts_with("CRYPT-LUKS2-") {
-            "LUKS2"
-        } else if uuid.starts_with("CRYPT-LUKS1-") {
-            "LUKS1"
-        } else {
-            "dm-crypt"
-        };
-        SecurityCheck {
-            id: "luks",
-            label: "Disk Encryption",
-            status: "pass",
-            detail: format!("Root / backed by {kind} dm-crypt ({dm_dev})"),
+    let root_devices = if fstype == "btrfs" {
+        match enumerate_btrfs_backing_devices(&primary_block) {
+            Some(devs) if !devs.is_empty() => devs,
+            _ => {
+                return SecurityCheck {
+                    id: "luks",
+                    label: "Disk Encryption",
+                    status: "warn",
+                    detail: format!(
+                        "Root / is Btrfs ({primary_block}), unable to enumerate all backing devices"
+                    ),
+                };
+            }
         }
     } else {
-        SecurityCheck {
-            id: "luks",
-            label: "Disk Encryption",
-            status: "warn",
-            detail: format!("Root / mounted on {block_name} (no dm-crypt ancestor)"),
-        }
-    }
+        vec![primary_block]
+    };
+
+    evaluate_block_encryption(&root_devices, read_sysfs_block_node)
 }
 
-/// Extract `(major:minor, mount_source)` for the active `/` mount point from
-/// `/proc/self/mountinfo` (taking the last matching `/` entry in mount order).
-pub fn extract_root_mount_source(mountinfo: &str) -> Option<(String, String)> {
-    let mut found: Option<(String, String)> = None;
+/// Extract `(fstype, major:minor, mount_source)` for the active `/` mount point
+/// from `/proc/self/mountinfo` (last matching `/` entry in mount order).
+pub fn extract_root_mount_info(mountinfo: &str) -> Option<(String, String, String)> {
+    let mut found: Option<(String, String, String)> = None;
     for line in mountinfo.lines() {
         let Some((left, right)) = line.split_once(" - ") else {
             continue;
         };
-        let left_fields: Vec<&str> = left.split_whitespace().collect();
+        let left_fields: Vec<&str> = left.split(' ').collect();
         if left_fields.len() < 5 || left_fields[4] != "/" {
             continue;
         }
-        let right_fields: Vec<&str> = right.split_whitespace().collect();
-        if right_fields.len() < 2 {
+        let right_fields: Vec<&str> = right.split(' ').collect();
+        if right_fields.is_empty() {
             continue;
         }
         let maj_min = left_fields[2].to_string();
-        let source = right_fields[1].to_string();
-        found = Some((maj_min, source));
+        let fstype = right_fields[0].to_string();
+        let source = right_fields.get(1).copied().unwrap_or("").to_string();
+        found = Some((fstype, maj_min, source));
     }
     found
 }
@@ -296,34 +330,197 @@ fn resolve_block_device_name(maj_min: &str, source: &str) -> Option<String> {
     None
 }
 
+fn enumerate_btrfs_backing_devices(primary_dev: &str) -> Option<Vec<String>> {
+    let rd = fs::read_dir("/sys/fs/btrfs").ok()?;
+    for entry in rd.flatten() {
+        let dev_dir = entry.path().join("devices");
+        if !dev_dir.is_dir() {
+            continue;
+        }
+        let entries = fs::read_dir(&dev_dir).ok()?;
+        let mut devs: Vec<String> = Vec::new();
+        for d in entries.flatten() {
+            devs.push(d.file_name().to_string_lossy().into_owned());
+        }
+        devs.sort();
+        if devs.iter().any(|d| d == primary_dev) {
+            return Some(devs);
+        }
+    }
+    None
+}
+
 pub fn is_crypt_dm_uuid(uuid: &str) -> bool {
     uuid.trim().starts_with("CRYPT-")
 }
 
-fn find_crypt_dm_ancestor(
-    dev_name: &str,
-    visited: &mut HashSet<String>,
-    depth: usize,
-) -> Option<(String, String)> {
-    if depth > 8 || !visited.insert(dev_name.to_string()) {
+#[derive(Debug, Clone)]
+pub struct BlockNode {
+    pub dm_uuid: Option<String>,
+    pub slaves: Option<Vec<String>>,
+}
+
+fn read_sysfs_block_node(dev_name: &str) -> Option<BlockNode> {
+    let block_dir = Path::new("/sys/class/block").join(dev_name);
+    if !block_dir.exists() {
         return None;
     }
-    let block_dir = Path::new("/sys/class/block").join(dev_name);
-    if let Ok(uuid) = fs::read_to_string(block_dir.join("dm/uuid"))
-        && is_crypt_dm_uuid(&uuid)
-    {
-        return Some((dev_name.to_string(), uuid.trim().to_string()));
-    }
+    let dm_uuid = fs::read_to_string(block_dir.join("dm/uuid"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let slaves_dir = block_dir.join("slaves");
-    if let Ok(entries) = fs::read_dir(slaves_dir) {
-        for entry in entries.flatten() {
-            let slave_name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(hit) = find_crypt_dm_ancestor(&slave_name, visited, depth + 1) {
-                return Some(hit);
+    let slaves = if slaves_dir.is_dir() {
+        match fs::read_dir(&slaves_dir) {
+            Ok(rd) => {
+                let mut list: Vec<String> = rd
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                list.sort();
+                Some(list)
+            }
+            Err(_) => None,
+        }
+    } else {
+        Some(Vec::new())
+    };
+    Some(BlockNode { dm_uuid, slaves })
+}
+
+/// Universally verify that EVERY data-bearing backing branch for `/` terminates
+/// at a kernel dm-crypt (`CRYPT-...`) node before reporting full root encryption.
+pub fn evaluate_block_encryption<F>(roots: &[String], lookup: F) -> SecurityCheck
+where
+    F: Fn(&str) -> Option<BlockNode>,
+{
+    if roots.is_empty() {
+        return SecurityCheck {
+            id: "luks",
+            label: "Disk Encryption",
+            status: "warn",
+            detail: "No backing block devices identified for /".into(),
+        };
+    }
+
+    let mut encrypted: Vec<(String, String)> = Vec::new();
+    let mut unencrypted: Vec<String> = Vec::new();
+    let mut unverified: Vec<String> = Vec::new();
+
+    fn walk<F>(
+        dev: &str,
+        lookup: &F,
+        path_stack: &mut HashSet<String>,
+        depth: usize,
+        encrypted: &mut Vec<(String, String)>,
+        unencrypted: &mut Vec<String>,
+        unverified: &mut Vec<String>,
+    ) where
+        F: Fn(&str) -> Option<BlockNode>,
+    {
+        if depth > 8 || !path_stack.insert(dev.to_string()) {
+            unverified.push(dev.to_string());
+            return;
+        }
+        let Some(node) = lookup(dev) else {
+            unverified.push(dev.to_string());
+            path_stack.remove(dev);
+            return;
+        };
+        if let Some(uuid) = &node.dm_uuid
+            && is_crypt_dm_uuid(uuid)
+        {
+            let kind = if uuid.starts_with("CRYPT-LUKS2-") {
+                "LUKS2"
+            } else if uuid.starts_with("CRYPT-LUKS1-") {
+                "LUKS1"
+            } else {
+                "dm-crypt"
+            };
+            if !encrypted.iter().any(|(d, _)| d == dev) {
+                encrypted.push((dev.to_string(), kind.to_string()));
+            }
+            path_stack.remove(dev);
+            return;
+        }
+        match node.slaves {
+            None => unverified.push(dev.to_string()),
+            Some(slaves) if slaves.is_empty() => {
+                if !unencrypted.iter().any(|d| d == dev) {
+                    unencrypted.push(dev.to_string());
+                }
+            }
+            Some(slaves) => {
+                for slave in slaves {
+                    walk(
+                        &slave,
+                        lookup,
+                        path_stack,
+                        depth + 1,
+                        encrypted,
+                        unencrypted,
+                        unverified,
+                    );
+                }
             }
         }
+        path_stack.remove(dev);
     }
-    None
+
+    let mut stack = HashSet::new();
+    for root in roots {
+        walk(
+            root,
+            &lookup,
+            &mut stack,
+            0,
+            &mut encrypted,
+            &mut unencrypted,
+            &mut unverified,
+        );
+    }
+
+    if !unencrypted.is_empty() && !encrypted.is_empty() {
+        let enc_names: Vec<&str> = encrypted.iter().map(|(d, _)| d.as_str()).collect();
+        SecurityCheck {
+            id: "luks",
+            label: "Disk Encryption",
+            status: "fail",
+            detail: format!(
+                "Mixed root / backing: unencrypted {} alongside dm-crypt ({})",
+                unencrypted.join(", "),
+                enc_names.join(", ")
+            ),
+        }
+    } else if !unverified.is_empty() {
+        SecurityCheck {
+            id: "luks",
+            label: "Disk Encryption",
+            status: "warn",
+            detail: format!(
+                "Unable to verify all root / backing branches ({})",
+                unverified.join(", ")
+            ),
+        }
+    } else if unencrypted.is_empty() && !encrypted.is_empty() {
+        let summary: Vec<String> = encrypted
+            .iter()
+            .map(|(d, k)| format!("{d}:{k}"))
+            .collect();
+        SecurityCheck {
+            id: "luks",
+            label: "Disk Encryption",
+            status: "pass",
+            detail: format!("Root / fully backed by dm-crypt ({})", summary.join(", ")),
+        }
+    } else {
+        SecurityCheck {
+            id: "luks",
+            label: "Disk Encryption",
+            status: "warn",
+            detail: format!("Root / mounted on {} (not backed by dm-crypt)", unencrypted.join(", ")),
+        }
+    }
 }
 
 fn check_aslr() -> SecurityCheck {
@@ -574,34 +771,108 @@ mod tests {
     }
 
     #[test]
-    fn firewall_fails_when_config_exists_but_services_inactive() {
-        let chk = evaluate_firewall_state(
+    fn firewall_distinguishes_running_service_from_verified_policy() {
+        // Config present but services stopped -> FAIL
+        let inactive = evaluate_firewall_state(
             Some(("inactive".into(), "inactive".into(), "inactive".into())),
             Some(true),
+            Some("DROP"),
             true,
         );
-        assert_eq!(chk.status, "fail");
+        assert_eq!(inactive.status, "fail");
 
-        let ok = evaluate_firewall_state(
+        // Running ufw/firewalld/nftables without root policy audit -> INFO (never false PASS)
+        let ufw_running = evaluate_firewall_state(
             Some(("active".into(), "inactive".into(), "inactive".into())),
             Some(true),
+            Some("DROP"),
             true,
         );
-        assert_eq!(ok.status, "pass");
+        assert_eq!(ufw_running.status, "info");
 
-        let no_systemd = evaluate_firewall_state(None, Some(true), true);
+        let fwld_running = evaluate_firewall_state(
+            Some(("inactive".into(), "inactive".into(), "active".into())),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(fwld_running.status, "info");
+
+        // Running UFW with explicit DEFAULT_INPUT_POLICY=ACCEPT -> WARN
+        let ufw_accept = evaluate_firewall_state(
+            Some(("active".into(), "inactive".into(), "inactive".into())),
+            Some(true),
+            Some("ACCEPT"),
+            true,
+        );
+        assert_eq!(ufw_accept.status, "warn");
+
+        let no_systemd = evaluate_firewall_state(None, Some(true), Some("DROP"), true);
         assert_eq!(no_systemd.status, "warn");
     }
 
     #[test]
-    fn parses_root_mount_source_and_dm_crypt_uuid() {
+    fn root_encryption_verifies_every_backing_branch() {
         let mi = "29 1 0:27 /@ / rw,relatime shared:1 - btrfs /dev/mapper/root rw,compress=zstd:3\n\
                   30 29 0:28 /@home /home rw,relatime - btrfs /dev/mapper/root rw\n";
         assert_eq!(
-            extract_root_mount_source(mi),
-            Some(("0:27".into(), "/dev/mapper/root".into()))
+            extract_root_mount_info(mi),
+            Some(("btrfs".into(), "0:27".into(), "/dev/mapper/root".into()))
         );
         assert!(is_crypt_dm_uuid("CRYPT-LUKS2-6402632d2ba5443f8ff4043762fb3bcf-root\n"));
         assert!(!is_crypt_dm_uuid("LVM-abcd1234"));
+
+        // Mixed LVM volume: one encrypted slave (dm-0) + one raw slave (nvme1n1p1) -> FAIL!
+        let mixed = evaluate_block_encryption(&["dm-2".into()], |dev| match dev {
+            "dm-2" => Some(BlockNode {
+                dm_uuid: Some("LVM-rootvg-root".into()),
+                slaves: Some(vec!["dm-0".into(), "nvme1n1p1".into()]),
+            }),
+            "dm-0" => Some(BlockNode {
+                dm_uuid: Some("CRYPT-LUKS2-aaa-crypt0".into()),
+                slaves: Some(vec!["nvme0n1p2".into()]),
+            }),
+            "nvme1n1p1" => Some(BlockNode {
+                dm_uuid: None,
+                slaves: Some(vec![]),
+            }),
+            _ => None,
+        });
+        assert_eq!(mixed.status, "fail");
+        assert!(mixed.detail.contains("nvme1n1p1"));
+
+        // Multi-device Btrfs: dm-0 encrypted + sdb1 raw -> FAIL!
+        let mixed_btrfs = evaluate_block_encryption(&["dm-0".into(), "sdb1".into()], |dev| match dev {
+            "dm-0" => Some(BlockNode {
+                dm_uuid: Some("CRYPT-LUKS2-aaa-crypt0".into()),
+                slaves: Some(vec!["nvme0n1p2".into()]),
+            }),
+            "sdb1" => Some(BlockNode {
+                dm_uuid: None,
+                slaves: Some(vec![]),
+            }),
+            _ => None,
+        });
+        assert_eq!(mixed_btrfs.status, "fail");
+
+        // Fully encrypted multi-branch LVM (both dm-0 & dm-1 are LUKS2) -> PASS!
+        let full = evaluate_block_encryption(&["dm-2".into()], |dev| match dev {
+            "dm-2" => Some(BlockNode {
+                dm_uuid: Some("LVM-rootvg-root".into()),
+                slaves: Some(vec!["dm-0".into(), "dm-1".into()]),
+            }),
+            "dm-0" => Some(BlockNode {
+                dm_uuid: Some("CRYPT-LUKS2-aaa-crypt0".into()),
+                slaves: Some(vec!["nvme0n1p2".into()]),
+            }),
+            "dm-1" => Some(BlockNode {
+                dm_uuid: Some("CRYPT-LUKS2-bbb-crypt1".into()),
+                slaves: Some(vec!["nvme1n1p1".into()]),
+            }),
+            _ => None,
+        });
+        assert_eq!(full.status, "pass");
+        assert!(full.detail.contains("dm-0:LUKS2"));
+        assert!(full.detail.contains("dm-1:LUKS2"));
     }
 }

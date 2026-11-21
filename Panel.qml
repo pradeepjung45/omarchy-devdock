@@ -535,6 +535,67 @@ Panel {
             }
           }
 
+          // ── Persistent Unknown K8s Target Banner (fail-closed) ──────────
+          BorderSurface {
+            visible: !devdock.binaryMissing && devdock.kube.targetUnknown === true
+            width: parent.width
+            implicitHeight: unknownKubeRow.implicitHeight + Style.space(12)
+            radius: Style.cornerRadius
+            color: Util.alpha(root.warnColor, 0.16)
+            borderSpec: Border.controlSpec("focus", root.warnColor, root.warnColor)
+
+            RowLayout {
+              id: unknownKubeRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                text: "▲"
+                color: root.warnColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+              }
+
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(1)
+
+                Text {
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  text: "K8S TARGET UNKNOWN"
+                  color: root.warnColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  text: devdock.kube.warningDetail !== ""
+                    ? devdock.kube.warningDetail
+                    : "Unable to verify merged kubeconfig — check active context before running commands"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+
+              ActionPill {
+                label: "Inspect"
+                tintColor: root.warnColor
+                onClicked: root.activeTab = "infra"
+              }
+            }
+          }
+
           // ── Binary Missing Setup Card ───────────────────────────────────
           BorderSurface {
             visible: devdock.binaryMissing
@@ -653,12 +714,14 @@ Panel {
               label: "Infra"
               badge: devdock.kube.currentIsProd
                 ? "PROD"
-                : (devdock.services.failedCount > 0
-                  ? ("!" + devdock.services.failedCount)
-                  : String(devdock.services.daemons.length))
+                : (devdock.kube.targetUnknown
+                  ? "K8s?"
+                  : (devdock.services.failedCount > 0
+                    ? ("!" + devdock.services.failedCount)
+                    : String(devdock.services.daemons.length)))
               active: root.activeTab === "infra"
               tabColor: root.warnColor
-              urgentBadge: devdock.kube.currentIsProd === true || devdock.services.failedCount > 0
+              urgentBadge: devdock.kube.currentIsProd === true || devdock.kube.targetUnknown === true || devdock.services.failedCount > 0
               onClicked: root.activeTab = "infra"
             }
 
@@ -1227,7 +1290,9 @@ Panel {
                         ? (devdock.security.failCount + " FAIL")
                         : (devdock.security.warnCount > 0
                           ? (devdock.security.passCount + "/" + devdock.security.checks.length + " · " + devdock.security.warnCount + " WARN")
-                          : (devdock.security.passCount + "/" + devdock.security.checks.length + " PASS"))
+                          : (devdock.security.infoCount > 0
+                            ? (devdock.security.passCount + "/" + devdock.security.checks.length + " PASS · " + devdock.security.infoCount + " INFO")
+                            : (devdock.security.passCount + "/" + devdock.security.checks.length + " PASS")))
                       badgeColor: devdock.security.failCount > 0
                         ? root.dangerColor
                         : (devdock.security.warnCount > 0 ? root.warnColor : root.okColor)
@@ -1328,16 +1393,31 @@ Panel {
               spacing: Style.space(6)
 
               PanelSectionHeader {
-                text: devdock.kube.available
-                  ? ("KUBECONFIG CONTEXTS (" + root.filteredContexts.length + ")")
-                  : "KUBERNETES"
-                foreground: root.foreground
+                text: devdock.kube.targetUnknown
+                  ? "KUBERNETES · TARGET UNKNOWN"
+                  : (devdock.kube.available
+                    ? ("KUBECONFIG CONTEXTS (" + root.filteredContexts.length + ")")
+                    : "KUBERNETES")
+                foreground: devdock.kube.targetUnknown ? root.warnColor : root.foreground
                 fontFamily: root.fontFamily
               }
 
               Text {
                 textFormat: Text.PlainText
-                visible: !devdock.kube.available
+                visible: devdock.kube.targetUnknown === true
+                width: parent.width
+                text: "Could not safely determine active Kubernetes target ("
+                  + (devdock.kube.warningDetail !== "" ? devdock.kube.warningDetail : "unparseable kubeconfig")
+                  + "). Verify with 'kubectl config current-context' before running commands."
+                color: root.warnColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: !devdock.kube.available && !devdock.kube.targetUnknown
                 width: parent.width
                 text: "No ~/.kube/config contexts found. When present, DevDock displays your active context and guards production clusters in red on the bar."
                 color: root.dim
@@ -1347,7 +1427,7 @@ Panel {
               }
 
               Repeater {
-                model: (root.activeTab === "infra" && devdock.kube.available) ? root.filteredContexts : []
+                model: (root.activeTab === "infra" && devdock.kube.available && !devdock.kube.targetUnknown) ? root.filteredContexts : []
                 KubeContextRow {
                   required property var modelData
                   width: parent.width
@@ -2545,17 +2625,22 @@ Panel {
     readonly property string st: check ? String(check.status || "pass") : "pass"
     readonly property bool isFail: st === "fail"
     readonly property bool isWarn: st === "warn"
+    readonly property bool isInfo: st === "info"
 
     implicitHeight: srowLayout.implicitHeight + Style.space(8)
     radius: Style.cornerRadius
     color: srow.isFail
       ? Util.alpha(root.dangerColor, 0.14)
-      : (srow.isWarn ? Util.alpha(root.warnColor, 0.10) : "transparent")
+      : (srow.isWarn
+        ? Util.alpha(root.warnColor, 0.10)
+        : (srow.isInfo ? Util.alpha(root.infoColor, 0.08) : "transparent"))
     borderSpec: srow.isFail
       ? Border.controlSpec("normal", root.dangerColor, root.dangerColor)
       : (srow.isWarn
         ? Border.controlSpec("normal", Util.alpha(root.warnColor, 0.55), root.warnColor)
-        : Border.controlSpec("normal", Qt.darker(root.foreground, 2.4), root.okColor))
+        : (srow.isInfo
+          ? Border.controlSpec("normal", Util.alpha(root.infoColor, 0.48), root.infoColor)
+          : Border.controlSpec("normal", Qt.darker(root.foreground, 2.4), root.okColor)))
 
     RowLayout {
       id: srowLayout
@@ -2568,8 +2653,10 @@ Panel {
 
       Text {
         textFormat: Text.PlainText
-        text: srow.isFail ? "󰀪" : (srow.isWarn ? "▲" : "󰄬")
-        color: srow.isFail ? root.dangerColor : (srow.isWarn ? root.warnColor : root.okColor)
+        text: srow.isFail ? "󰀪" : (srow.isWarn ? "▲" : (srow.isInfo ? "󰋼" : "󰄬"))
+        color: srow.isFail
+          ? root.dangerColor
+          : (srow.isWarn ? root.warnColor : (srow.isInfo ? root.infoColor : root.okColor))
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
       }
@@ -2585,7 +2672,7 @@ Panel {
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
-          font.bold: srow.isFail || srow.isWarn
+          font.bold: srow.isFail || srow.isWarn || srow.isInfo
           elide: Text.ElideRight
         }
 
