@@ -1,0 +1,17 @@
+[package]
+name = "devdock"
+version = "1.0.0"
+edition = "2024"
+description = "Blazing-fast Rust backend & CLI for Omarchy DevDock — Ports, Tunnels, Containers, K8s PROD Guard & Services"
+license = "MIT"
+authors = ["Pradeep Karki <karkeepradeep654@gmail.com>"]
+
+[[bin]]
+name = "devdock"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

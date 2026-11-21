@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run Rust unit tests
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Run QML model and security hygiene tests
+        run: node --test "test/*.test.mjs"
+      - name: Verify manifest.json schema fields
+        run: |
+          jq -e '.schemaVersion == 1 and .id == "io.github.pradeepjung45.devdock" and .entryPoints.barWidget == "Panel.qml"' manifest.json

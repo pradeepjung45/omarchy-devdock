@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.pradeepjung45.devdock",
+  "name": "DevDock",
+  "version": "1.0.0",
+  "author": "pradeepjung45",
+  "license": "MIT",
+  "description": "Zero-dependency Rust + QML Dev, DevOps & Arch OS Control Center for the Omarchy bar: live local ports & HTTP health probes, SSH/K8s tunnels, UNIX-socket Docker/Podman with inline logs & Compose stacks, live internet traffic & kernel security radar, Kubernetes PROD guard, systemd health, and interactive Arch OS architecture map.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "DevDock",
+    "description": "Live dev ports, UNIX-socket Docker & inline logs, internet traffic & OS security radar, K8s PROD guard, and Arch OS architecture map.",
+    "category": "Developer",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5,
+      "showSystemPorts": false,
+      "crashNotifications": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "showSystemPorts",
+        "type": "boolean",
+        "label": "Expand background and system ports by default",
+        "defaultValue": false
+      },
+      {
+        "key": "crashNotifications",
+        "type": "boolean",
+        "label": "Notify when a running dev server or container exits unexpectedly",
+        "defaultValue": true
+      }
+    ]
+  }
+}
