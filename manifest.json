@@ -19,11 +19,36 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
+      "colorScheme": "Auto",
       "refreshIntervalSec": 5,
       "showSystemPorts": false,
       "crashNotifications": true
     },
     "schema": [
+      {
+        "key": "colorScheme",
+        "type": "enum",
+        "label": "Color palette",
+        "options": [
+          "Auto",
+          "Crimson",
+          "Bloodline",
+          "Cyber",
+          "Matrix",
+          "Synthwave",
+          "AmberGold",
+          "Tokyo",
+          "Catppuccin",
+          "RosePine",
+          "Dracula",
+          "Kanagawa",
+          "Everforest",
+          "Nord",
+          "Gruvbox",
+          "Mono"
+        ],
+        "defaultValue": "Auto"
+      },
       {
         "key": "refreshIntervalSec",
         "type": "integer",

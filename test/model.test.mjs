@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
@@ -147,7 +148,7 @@ test("formatUptime and formatMem produce concise labels", () => {
   assert.equal(Model.formatMem(2048), "2.0 GB");
 });
 
-test("composeStacks groups multi-container compose projects", () => {
+test("composeStacks groups multi-container compose projects with pinned IDs", () => {
   const stacks = Model.composeStacks([
     { id: "1", name: "pradeepos-db-1", state: "running", composeProject: "pradeepos" },
     { id: "2", name: "pradeepos-api-1", state: "exited", composeProject: "pradeepos" },
@@ -157,6 +158,27 @@ test("composeStacks groups multi-container compose projects", () => {
   assert.equal(stacks[0].project, "pradeepos");
   assert.equal(stacks[0].total, 2);
   assert.equal(stacks[0].running, 1);
+  assert.deepEqual([...stacks[0].stopIds], ["1"]);
+  assert.deepEqual([...stacks[0].startIds], ["2"]);
+});
+
+test("resolvePalette resolves Auto, named presets, and Mono", () => {
+  const autoPal = Model.resolvePalette("Auto", { green: "#4ecdc4", blue: "#6a85ff", purple: "#b388eb", cyan: "#a5f5ff", amber: "#f5b971", red: "#ff7b92" });
+  assert.equal(autoPal.green, "#4ecdc4");
+  assert.equal(autoPal.purple, "#b388eb");
+  const crimson = Model.resolvePalette("Crimson", {});
+  assert.equal(crimson.blue, "#ff4757");
+  assert.equal(crimson.purple, "#ff2e63");
+  const matrix = Model.resolvePalette("Matrix", {});
+  assert.equal(matrix.green, "#00ff88");
+  const cyber = Model.resolvePalette("Cyber", {});
+  assert.equal(cyber.green, "#34d399");
+  assert.equal(cyber.cyan, "#38bdf8");
+  const mono = Model.resolvePalette("Mono", { green: "#4ecdc4" });
+  assert.equal(mono.green, "");
+  assert.equal(mono.purple, "");
+  assert.equal(Model.COLOR_SCHEMES.length, 16);
+  assert.equal(Model.schemeMeta("Crimson").desc, "Scarlet & ember");
 });
 
 test("manifest.json is valid and points to Panel.qml", () => {
@@ -167,9 +189,32 @@ test("manifest.json is valid and points to Panel.qml", () => {
   assert.equal(manifest.entryPoints.barWidget, "Panel.qml");
 });
 
+test("EXPECTED_SOURCE_SHA256 matches the exact Rust source tree digest", () => {
+  const files = ["Cargo.toml", "Cargo.lock", "build.rs"];
+  const srcFiles = fs
+    .readdirSync(path.join(ROOT, "src"))
+    .filter((f) => f.endsWith(".rs"))
+    .sort()
+    .map((f) => `src/${f}`);
+  files.push(...srcFiles);
+
+  const hash = crypto.createHash("sha256");
+  for (const rel of files) {
+    const buf = fs.readFileSync(path.join(ROOT, rel));
+    hash.update(rel);
+    hash.update(Buffer.from([0]));
+    hash.update(String(buf.length));
+    hash.update(Buffer.from([0]));
+    hash.update(buf);
+  }
+  assert.equal(Model.EXPECTED_SOURCE_SHA256, hash.digest("hex"));
+});
+
 test("QML security & Omarchy hygiene checks", () => {
   const panelQml = fs.readFileSync(path.join(ROOT, "Panel.qml"), "utf8");
   const serviceQml = fs.readFileSync(path.join(ROOT, "Service.qml"), "utf8");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  const dockerRs = fs.readFileSync(path.join(ROOT, "src/docker.rs"), "utf8");
 
   // Never access IpcRegistry or spawn shell strings
   assert.equal(panelQml.includes("IpcRegistry"), false);
@@ -180,6 +225,23 @@ test("QML security & Omarchy hygiene checks", () => {
   assert.equal(panelQml.includes("Qt.alpha("), false);
   assert.equal(panelQml.toLowerCase().includes("omaphoenix"), false);
   assert.equal(serviceQml.toLowerCase().includes("omaphoenix"), false);
+
+  // Security review regression guards:
+  // 1. Never pass raw inline logs via process argv
+  assert.equal(panelQml.includes("copyText(devdock.logText"), false);
+  assert.ok(panelQml.includes("copyContainerLogs("));
+  // 2. Only run verified plugin-private bin/devdock (never ~/.local/bin or PATH)
+  assert.equal(serviceQml.includes(".local/bin/devdock"), false);
+  assert.equal(serviceQml.includes(".cargo/bin/devdock"), false);
+  assert.ok(serviceQml.includes("EXPECTED_SOURCE_SHA256"));
+  assert.ok(serviceQml.includes("sha256sum"));
+  // 3. No prebuilt release binary download documented
+  assert.equal(readme.includes("devdock-linux-x86_64"), false);
+  // 4. Local UNIX socket only for container listing (no ambient CLI context fallback)
+  assert.equal(dockerRs.includes("Command::new"), false);
+  // 5. Log tail viewer guards against cross-container race conditions
+  assert.ok(serviceQml.includes("_logRequestSeq"));
+  assert.ok(serviceQml.includes("_logInFlightSeq"));
 
   // Every Text { block in Panel.qml must declare textFormat: Text.PlainText
   const textBlocks = [...panelQml.matchAll(/\bText\s*\{/g)];

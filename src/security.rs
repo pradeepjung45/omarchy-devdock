@@ -1,7 +1,9 @@
 //! OS-level Linux security & hardening posture checks (zero root, read-only).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use crate::json::Json;
 use crate::proc_ports::ListeningPort;
@@ -95,56 +97,233 @@ fn read_sysctl_u32(path: &str) -> Option<u32> {
 }
 
 fn check_firewall() -> SecurityCheck {
-    if let Ok(raw) = fs::read_to_string("/etc/ufw/ufw.conf") {
-        let enabled = raw.lines().any(|l| l.trim() == "ENABLED=yes");
-        if enabled {
-            return SecurityCheck {
-                id: "firewall",
-                label: "Host Firewall",
-                status: "pass",
-                detail: "UFW enabled (/etc/ufw/ufw.conf)".into(),
-            };
-        }
+    // Query live runtime state from systemd (unprivileged) rather than trusting
+    // static config files on disk when the firewall service is stopped.
+    let states = query_firewall_services();
+    let ufw_conf_enabled = fs::read_to_string("/etc/ufw/ufw.conf")
+        .ok()
+        .map(|raw| raw.lines().any(|l| l.trim() == "ENABLED=yes"));
+    let has_any_config = Path::new("/etc/ufw/ufw.conf").exists()
+        || Path::new("/etc/nftables.conf").exists();
+
+    evaluate_firewall_state(states, ufw_conf_enabled, has_any_config)
+}
+
+fn query_firewall_services() -> Option<(String, String, String)> {
+    let out = Command::new("systemctl")
+        .args(["is-active", "ufw.service", "nftables.service", "firewalld.service"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines().map(|l| l.trim().to_string());
+    let ufw = lines.next()?;
+    let nft = lines.next().unwrap_or_default();
+    let fwld = lines.next().unwrap_or_default();
+    // Ignore empty output when systemd bus is unavailable (e.g. non-systemd container)
+    if ufw.is_empty() && nft.is_empty() && fwld.is_empty() {
+        return None;
+    }
+    Some((ufw, nft, fwld))
+}
+
+pub fn evaluate_firewall_state(
+    service_states: Option<(String, String, String)>,
+    ufw_conf_enabled: Option<bool>,
+    has_any_config: bool,
+) -> SecurityCheck {
+    let Some((ufw, nft, fwld)) = service_states else {
         return SecurityCheck {
             id: "firewall",
             label: "Host Firewall",
-            status: "fail",
-            detail: "UFW installed but ENABLED=no".into(),
+            status: "warn",
+            detail: "Cannot verify live firewall service state (systemd unavailable)".into(),
+        };
+    };
+
+    if ufw == "active" {
+        return match ufw_conf_enabled {
+            Some(true) => SecurityCheck {
+                id: "firewall",
+                label: "Host Firewall",
+                status: "pass",
+                detail: "ufw.service active and ENABLED=yes".into(),
+            },
+            Some(false) => SecurityCheck {
+                id: "firewall",
+                label: "Host Firewall",
+                status: "fail",
+                detail: "ufw.service active but ENABLED=no in /etc/ufw/ufw.conf".into(),
+            },
+            None => SecurityCheck {
+                id: "firewall",
+                label: "Host Firewall",
+                status: "warn",
+                detail: "ufw.service active, unable to confirm ENABLED=yes".into(),
+            },
         };
     }
-    if Path::new("/etc/nftables.conf").exists() {
+
+    if nft == "active" {
         return SecurityCheck {
             id: "firewall",
             label: "Host Firewall",
             status: "pass",
-            detail: "nftables configuration present".into(),
+            detail: "nftables.service active".into(),
         };
     }
-    SecurityCheck {
-        id: "firewall",
-        label: "Host Firewall",
-        status: "warn",
-        detail: "No UFW or nftables config detected".into(),
+
+    if fwld == "active" {
+        return SecurityCheck {
+            id: "firewall",
+            label: "Host Firewall",
+            status: "pass",
+            detail: "firewalld.service active".into(),
+        };
+    }
+
+    if has_any_config {
+        SecurityCheck {
+            id: "firewall",
+            label: "Host Firewall",
+            status: "fail",
+            detail: format!(
+                "Firewall config present but services inactive (ufw:{ufw}, nft:{nft}, firewalld:{fwld})"
+            ),
+        }
+    } else {
+        SecurityCheck {
+            id: "firewall",
+            label: "Host Firewall",
+            status: "warn",
+            detail: "No active firewall service (ufw/nftables/firewalld)".into(),
+        }
     }
 }
 
 fn check_luks_encryption() -> SecurityCheck {
-    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    if cmdline.contains("cryptdevice=") || cmdline.contains("rd.luks") || Path::new("/dev/mapper/root").exists() {
+    // Verify the actual mounted `/` root filesystem by resolving its backing
+    // block device from /proc/self/mountinfo and walking /sys/class/block/*/dm/uuid
+    // for a kernel dm-crypt ("CRYPT-...") UUID — never trusting /proc/cmdline or
+    // unrelated /dev/mapper/* names.
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return SecurityCheck {
+            id: "luks",
+            label: "Disk Encryption",
+            status: "warn",
+            detail: "Unable to read /proc/self/mountinfo".into(),
+        };
+    };
+    let Some((maj_min, source)) = extract_root_mount_source(&mountinfo) else {
+        return SecurityCheck {
+            id: "luks",
+            label: "Disk Encryption",
+            status: "warn",
+            detail: "Could not identify mounted / root device".into(),
+        };
+    };
+
+    let Some(block_name) = resolve_block_device_name(&maj_min, &source) else {
+        return SecurityCheck {
+            id: "luks",
+            label: "Disk Encryption",
+            status: "warn",
+            detail: format!("Root / mount source ({source}) is not a dm-crypt block device"),
+        };
+    };
+
+    let mut visited = HashSet::new();
+    if let Some((dm_dev, uuid)) = find_crypt_dm_ancestor(&block_name, &mut visited, 0) {
+        let kind = if uuid.starts_with("CRYPT-LUKS2-") {
+            "LUKS2"
+        } else if uuid.starts_with("CRYPT-LUKS1-") {
+            "LUKS1"
+        } else {
+            "dm-crypt"
+        };
         SecurityCheck {
             id: "luks",
             label: "Disk Encryption",
             status: "pass",
-            detail: "LUKS dm-crypt root active".into(),
+            detail: format!("Root / backed by {kind} dm-crypt ({dm_dev})"),
         }
     } else {
         SecurityCheck {
             id: "luks",
             label: "Disk Encryption",
             status: "warn",
-            detail: "Root partition not on LUKS dm-crypt".into(),
+            detail: format!("Root / mounted on {block_name} (no dm-crypt ancestor)"),
         }
     }
+}
+
+/// Extract `(major:minor, mount_source)` for the active `/` mount point from
+/// `/proc/self/mountinfo` (taking the last matching `/` entry in mount order).
+pub fn extract_root_mount_source(mountinfo: &str) -> Option<(String, String)> {
+    let mut found: Option<(String, String)> = None;
+    for line in mountinfo.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let left_fields: Vec<&str> = left.split_whitespace().collect();
+        if left_fields.len() < 5 || left_fields[4] != "/" {
+            continue;
+        }
+        let right_fields: Vec<&str> = right.split_whitespace().collect();
+        if right_fields.len() < 2 {
+            continue;
+        }
+        let maj_min = left_fields[2].to_string();
+        let source = right_fields[1].to_string();
+        found = Some((maj_min, source));
+    }
+    found
+}
+
+fn resolve_block_device_name(maj_min: &str, source: &str) -> Option<String> {
+    if source.starts_with("/dev/")
+        && let Ok(canon) = fs::canonicalize(source)
+        && let Some(name) = canon.file_name().and_then(|n| n.to_str())
+        && Path::new("/sys/class/block").join(name).exists()
+    {
+        return Some(name.to_string());
+    }
+    if !maj_min.starts_with("0:")
+        && let Ok(canon) = fs::canonicalize(format!("/sys/dev/block/{maj_min}"))
+        && let Some(name) = canon.file_name().and_then(|n| n.to_str())
+    {
+        return Some(name.to_string());
+    }
+    None
+}
+
+pub fn is_crypt_dm_uuid(uuid: &str) -> bool {
+    uuid.trim().starts_with("CRYPT-")
+}
+
+fn find_crypt_dm_ancestor(
+    dev_name: &str,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Option<(String, String)> {
+    if depth > 8 || !visited.insert(dev_name.to_string()) {
+        return None;
+    }
+    let block_dir = Path::new("/sys/class/block").join(dev_name);
+    if let Ok(uuid) = fs::read_to_string(block_dir.join("dm/uuid"))
+        && is_crypt_dm_uuid(&uuid)
+    {
+        return Some((dev_name.to_string(), uuid.trim().to_string()));
+    }
+    let slaves_dir = block_dir.join("slaves");
+    if let Ok(entries) = fs::read_dir(slaves_dir) {
+        for entry in entries.flatten() {
+            let slave_name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(hit) = find_crypt_dm_ancestor(&slave_name, visited, depth + 1) {
+                return Some(hit);
+            }
+        }
+    }
+    None
 }
 
 fn check_aslr() -> SecurityCheck {
@@ -392,5 +571,37 @@ mod tests {
         let chk = check_exposed_data_ports(&[port]);
         assert_eq!(chk.status, "warn");
         assert!(chk.detail.contains(":5432 PostgreSQL"));
+    }
+
+    #[test]
+    fn firewall_fails_when_config_exists_but_services_inactive() {
+        let chk = evaluate_firewall_state(
+            Some(("inactive".into(), "inactive".into(), "inactive".into())),
+            Some(true),
+            true,
+        );
+        assert_eq!(chk.status, "fail");
+
+        let ok = evaluate_firewall_state(
+            Some(("active".into(), "inactive".into(), "inactive".into())),
+            Some(true),
+            true,
+        );
+        assert_eq!(ok.status, "pass");
+
+        let no_systemd = evaluate_firewall_state(None, Some(true), true);
+        assert_eq!(no_systemd.status, "warn");
+    }
+
+    #[test]
+    fn parses_root_mount_source_and_dm_crypt_uuid() {
+        let mi = "29 1 0:27 /@ / rw,relatime shared:1 - btrfs /dev/mapper/root rw,compress=zstd:3\n\
+                  30 29 0:28 /@home /home rw,relatime - btrfs /dev/mapper/root rw\n";
+        assert_eq!(
+            extract_root_mount_source(mi),
+            Some(("0:27".into(), "/dev/mapper/root".into()))
+        );
+        assert!(is_crypt_dm_uuid("CRYPT-LUKS2-6402632d2ba5443f8ff4043762fb3bcf-root\n"));
+        assert!(!is_crypt_dm_uuid("LVM-abcd1234"));
     }
 }

@@ -1,5 +1,7 @@
 .pragma library
 
+var EXPECTED_SOURCE_SHA256 = "d33afcc3c875141b953c72410453297079aa4cd2d4768c46f7d1c542d097973e"
+
 function emptySnapshot() {
   return {
     version: 2,
@@ -23,7 +25,15 @@ function emptySnapshot() {
       diskPct: 0,
       lanIp: "",
       tailscaleIp: "",
-      hostname: ""
+      hostname: "",
+      palette: {
+        red: "",
+        green: "",
+        amber: "",
+        blue: "",
+        purple: "",
+        cyan: ""
+      }
     },
     ports: [],
     tunnels: [],
@@ -128,6 +138,14 @@ function parseSnapshot(raw) {
       base.host.lanIp = String(data.host.lanIp || "")
       base.host.tailscaleIp = String(data.host.tailscaleIp || "")
       base.host.hostname = String(data.host.hostname || "")
+      if (data.host.palette && typeof data.host.palette === "object") {
+        base.host.palette.red = String(data.host.palette.red || "")
+        base.host.palette.green = String(data.host.palette.green || "")
+        base.host.palette.amber = String(data.host.palette.amber || "")
+        base.host.palette.blue = String(data.host.palette.blue || "")
+        base.host.palette.purple = String(data.host.palette.purple || "")
+        base.host.palette.cyan = String(data.host.palette.cyan || "")
+      }
     }
     if (Array.isArray(data.ports)) base.ports = data.ports
     if (Array.isArray(data.tunnels)) base.tunnels = data.tunnels
@@ -347,11 +365,17 @@ function composeStacks(items) {
     var proj = c && c.composeProject ? String(c.composeProject).trim() : ""
     if (proj === "") continue
     if (!byProject[proj]) {
-      byProject[proj] = { project: proj, total: 0, running: 0 }
+      byProject[proj] = { project: proj, total: 0, running: 0, startIds: [], stopIds: [] }
       order.push(byProject[proj])
     }
     byProject[proj].total += 1
-    if (String(c.state || "").toLowerCase() === "running") byProject[proj].running += 1
+    var cid = c && c.id ? String(c.id).trim() : ""
+    if (String(c.state || "").toLowerCase() === "running") {
+      byProject[proj].running += 1
+      if (cid !== "") byProject[proj].stopIds.push(cid)
+    } else if (cid !== "") {
+      byProject[proj].startIds.push(cid)
+    }
   }
   return order
 }
@@ -476,4 +500,56 @@ function barTooltip(summary, host, binaryMissing) {
   if (Number(s.failedServices || 0) > 0) parts.push(s.failedServices + " failed units")
   if (Number(h.memPct || 0) > 0) parts.push("RAM " + h.memPct + "%")
   return parts.join(" · ")
+}
+
+var COLOR_SCHEMES = [
+  { id: "Auto", label: "Auto", desc: "Live Omarchy theme", green: "#4ecdc4", cyan: "#38bdf8", blue: "#60a5fa", purple: "#b388eb", amber: "#f5b971", red: "#ff7b92" },
+  { id: "Crimson", label: "Crimson", desc: "Scarlet & ember", green: "#ff5c77", cyan: "#ff9f43", blue: "#ff4757", purple: "#ff2e63", amber: "#ffbe76", red: "#ff3838" },
+  { id: "Bloodline", label: "Bloodline", desc: "Samurai red & rose", green: "#f43f5e", cyan: "#fda4af", blue: "#fb7185", purple: "#e11d48", amber: "#fb923c", red: "#ef4444" },
+  { id: "Cyber", label: "Cyber", desc: "Vivid neon accents", green: "#34d399", cyan: "#38bdf8", blue: "#60a5fa", purple: "#c084fc", amber: "#fbbf24", red: "#fb7185" },
+  { id: "Matrix", label: "Matrix", desc: "Phosphor terminal", green: "#00ff88", cyan: "#4ade80", blue: "#22c55e", purple: "#86efac", amber: "#bef264", red: "#ff5555" },
+  { id: "Synthwave", label: "Synthwave", desc: "Outrun pink & laser", green: "#36f9f6", cyan: "#72f1b8", blue: "#ff7edb", purple: "#c084fc", amber: "#fede5d", red: "#fe4450" },
+  { id: "AmberGold", label: "Amber", desc: "Obsidian & molten gold", green: "#fbbf24", cyan: "#fcd34d", blue: "#f59e0b", purple: "#fb923c", amber: "#fde047", red: "#ef4444" },
+  { id: "Tokyo", label: "Tokyo", desc: "Tokyo Night", green: "#9ece6a", cyan: "#7dcfff", blue: "#7aa2f7", purple: "#bb9af7", amber: "#e0af68", red: "#f7768e" },
+  { id: "Catppuccin", label: "Catppuccin", desc: "Mocha pastels", green: "#a6e3a1", cyan: "#94e2d5", blue: "#89b4fa", purple: "#cba6f7", amber: "#f9e2af", red: "#f38ba8" },
+  { id: "RosePine", label: "Rosé Pine", desc: "Soho dusk & iris", green: "#9ccfd8", cyan: "#ebbcba", blue: "#56949f", purple: "#c4a7e7", amber: "#f6c177", red: "#eb6f92" },
+  { id: "Dracula", label: "Dracula", desc: "Vampire neon", green: "#50fa7b", cyan: "#8be9fd", blue: "#bd93f9", purple: "#ff79c6", amber: "#f1fa8c", red: "#ff5555" },
+  { id: "Kanagawa", label: "Kanagawa", desc: "Wave indigo & sakura", green: "#98bb6c", cyan: "#7fb4ca", blue: "#7e9cd8", purple: "#957fb8", amber: "#e6c384", red: "#e82424" },
+  { id: "Everforest", label: "Everforest", desc: "Moss & pine", green: "#a7c080", cyan: "#83c092", blue: "#7fbbb3", purple: "#d699b6", amber: "#dbbc7f", red: "#e67e80" },
+  { id: "Nord", label: "Nord", desc: "Arctic frost", green: "#a3be8c", cyan: "#88c0d0", blue: "#81a1c1", purple: "#b48ead", amber: "#ebcb8b", red: "#bf616a" },
+  { id: "Gruvbox", label: "Gruvbox", desc: "Warm retro", green: "#b8bb26", cyan: "#8ec07c", blue: "#83a598", purple: "#d3869b", amber: "#fabd2f", red: "#fb4934" },
+  { id: "Mono", label: "Mono", desc: "Minimalist theme", green: "", cyan: "", blue: "", purple: "", amber: "", red: "" }
+]
+
+function schemeMeta(schemeName) {
+  var name = String(schemeName || "Auto")
+  for (var i = 0; i < COLOR_SCHEMES.length; i++) {
+    if (COLOR_SCHEMES[i].id === name) return COLOR_SCHEMES[i]
+  }
+  return COLOR_SCHEMES[0]
+}
+
+function resolvePalette(schemeName, hostPalette) {
+  var name = String(schemeName || "Auto")
+  if (name === "Mono") {
+    return { green: "", cyan: "", blue: "", purple: "", amber: "", red: "" }
+  }
+  if (name === "Auto") {
+    var hp = hostPalette || {}
+    return {
+      green: String(hp.green || "#4ade80"),
+      cyan: String(hp.cyan || "#38bdf8"),
+      blue: String(hp.blue || "#60a5fa"),
+      purple: String(hp.purple || "#c084fc"),
+      amber: String(hp.amber || "#f5b971"),
+      red: String(hp.red || "")
+    }
+  }
+  for (var i = 0; i < COLOR_SCHEMES.length; i++) {
+    if (COLOR_SCHEMES[i].id === name) {
+      var s = COLOR_SCHEMES[i]
+      return { green: s.green, cyan: s.cyan, blue: s.blue, purple: s.purple, amber: s.amber, red: s.red }
+    }
+  }
+  return resolvePalette("Auto", hostPalette)
 }

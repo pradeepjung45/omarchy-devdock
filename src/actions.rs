@@ -4,7 +4,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::docker::{ContainersState, detect_engine};
+use crate::docker_sock::{detect_socket, lifecycle_on, list_containers_on, tail_logs};
 use crate::json::Json;
 use crate::kube::KubeState;
 use crate::proc_ports::{current_uid, pid_ancestry, verify_pid_owns_port};
@@ -71,9 +71,9 @@ pub fn open_url(url: &str) -> Result<String, String> {
     Ok("opened".into())
 }
 
-/// Copy safe text to Wayland clipboard via `wl-copy`.
-pub fn copy_text(text: &str) -> Result<String, String> {
-    if text.len() > 2048 || text.contains('\0') {
+/// Pipe validated text directly to `wl-copy` via stdin (never passed in argv).
+fn pipe_to_wl_copy(text: &str, max_bytes: usize) -> Result<String, String> {
+    if text.len() > max_bytes || text.contains('\0') {
         return Err("clipboard text invalid or too long".into());
     }
     let mut child = Command::new("wl-copy")
@@ -83,9 +83,50 @@ pub fn copy_text(text: &str) -> Result<String, String> {
         .spawn()
         .map_err(|e| format!("wl-copy failed: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("wl-copy write failed: {e}"))?;
     }
     Ok("copied".into())
+}
+
+/// Copy short non-secret text (URLs, IPs, ports) to Wayland clipboard via `wl-copy`.
+pub fn copy_text(text: &str) -> Result<String, String> {
+    pipe_to_wl_copy(text, 2048)
+}
+
+/// Copy text read from stdin to Wayland clipboard without exposing payload in argv.
+pub fn copy_stdin() -> Result<String, String> {
+    const MAX_CLIP: usize = 512 * 1024;
+    let mut buf = Vec::new();
+    io::stdin()
+        .take((MAX_CLIP + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("stdin read failed: {e}"))?;
+    if buf.len() > MAX_CLIP {
+        return Err("clipboard input exceeds 512 KiB limit".into());
+    }
+    let clean = String::from_utf8_lossy(&buf).replace('\0', "");
+    pipe_to_wl_copy(&clean, MAX_CLIP)
+}
+
+/// Fetch container logs directly over the local UNIX socket and pipe them
+/// straight to `wl-copy` stdin so raw log text never appears in process argv.
+pub fn copy_container_logs(id: &str, tail: u32) -> Result<String, String> {
+    validate_identifier(id)?;
+    let raw = tail_logs(id, tail)?;
+    const MAX_CLIP: usize = 512 * 1024;
+    let clean: String = raw.replace('\0', "");
+    let payload = if clean.len() > MAX_CLIP {
+        let mut cut = MAX_CLIP;
+        while cut > 0 && !clean.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        &clean[..cut]
+    } else {
+        &clean
+    };
+    pipe_to_wl_copy(payload, MAX_CLIP)
 }
 
 /// Jump Hyprland focus to the terminal/editor window whose PID is an ancestor of `pid`.
@@ -180,54 +221,90 @@ pub fn container_action(action: &str, id: &str) -> Result<String, String> {
         return Err(format!("unsupported container action: {action}"));
     }
     validate_identifier(id)?;
-    let engine = detect_engine().ok_or_else(|| "no container engine running".to_string())?;
+    let ep = detect_socket().ok_or_else(|| "no local container socket available".to_string())?;
 
     if action == "logs" {
-        return spawn_terminal_cmd(&[engine, "logs", "-f", "--tail", "150", id], true, "DevDock Logs");
+        let host_args = ep.cli_host_args();
+        let mut owned: Vec<String> = Vec::with_capacity(host_args.len() + 6);
+        owned.push(ep.engine.into());
+        owned.extend(host_args);
+        owned.extend(["logs", "-f", "--tail", "150", id].into_iter().map(String::from));
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        return spawn_terminal_cmd(&refs, true, "DevDock Logs");
     }
     if action == "exec" {
-        return spawn_terminal_cmd(&[engine, "exec", "-it", id, "sh"], false, "DevDock Shell");
+        let host_args = ep.cli_host_args();
+        let mut owned: Vec<String> = Vec::with_capacity(host_args.len() + 5);
+        owned.push(ep.engine.into());
+        owned.extend(host_args);
+        owned.extend(["exec", "-it", id, "sh"].into_iter().map(String::from));
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        return spawn_terminal_cmd(&refs, false, "DevDock Shell");
     }
 
-    // Fast path: direct UNIX socket HTTP/1.1 call (no Go CLI startup lag)
-    if let Ok(msg) = crate::docker_sock::lifecycle(action, id) {
-        return Ok(msg);
-    }
-
-    let status = Command::new(engine)
-        .args([action, id])
-        .status()
-        .map_err(|e| format!("{engine} {action} failed: {e}"))?;
-    if status.success() {
-        Ok(format!("{action}ed"))
-    } else {
-        Err(format!("{engine} {action} failed with {:?}", status.code()))
-    }
+    // Strictly target the pinned local UNIX socket — never fall back to ambient
+    // CLI contexts or DOCKER_HOST on local daemon failure.
+    lifecycle_on(&ep, action, id)
 }
 
-/// Start or stop every container belonging to a Docker Compose project concurrently.
-pub fn compose_stack_action(action: &str, project: &str) -> Result<String, String> {
+/// Start or stop containers belonging to a Docker Compose project concurrently
+/// on ONE pinned local UNIX socket. When `explicit_ids` are supplied (the UI
+/// always passes exact container IDs from the viewed snapshot), only those
+/// verified IDs on the same local daemon are acted on.
+pub fn compose_stack_action(
+    action: &str,
+    project: &str,
+    explicit_ids: &[String],
+) -> Result<String, String> {
     if !matches!(action, "start" | "stop") {
         return Err(format!("unsupported stack action: {action}"));
     }
     validate_identifier(project)?;
-    let state = ContainersState::collect();
-    if !state.available {
-        return Err("no container engine running".into());
+    for id in explicit_ids {
+        validate_identifier(id)?;
     }
-    let targets: Vec<String> = state
-        .items
-        .into_iter()
-        .filter(|c| c.compose_project == project)
-        .filter(|c| {
-            if action == "start" {
-                c.state != "running"
+
+    let ep = detect_socket().ok_or_else(|| "no local container socket available".to_string())?;
+    let state = list_containers_on(&ep)?;
+    if !state.available {
+        return Err("local container daemon unavailable".into());
+    }
+
+    let targets: Vec<String> = if !explicit_ids.is_empty() {
+        let mut verified = Vec::with_capacity(explicit_ids.len());
+        for req_id in explicit_ids {
+            let matched = state
+                .items
+                .iter()
+                .find(|c| c.id == *req_id && c.compose_project == project)
+                .ok_or_else(|| {
+                    format!("container {req_id} not found in local project {project}")
+                })?;
+            let needs_action = if action == "start" {
+                matched.state != "running"
             } else {
-                c.state == "running"
+                matched.state == "running"
+            };
+            if needs_action {
+                verified.push(matched.id.clone());
             }
-        })
-        .map(|c| c.id)
-        .collect();
+        }
+        verified
+    } else {
+        state
+            .items
+            .into_iter()
+            .filter(|c| c.compose_project == project)
+            .filter(|c| {
+                if action == "start" {
+                    c.state != "running"
+                } else {
+                    c.state == "running"
+                }
+            })
+            .map(|c| c.id)
+            .collect()
+    };
 
     if targets.is_empty() {
         return Ok(format!("stack {project} already {action}ed"));
@@ -235,10 +312,11 @@ pub fn compose_stack_action(action: &str, project: &str) -> Result<String, Strin
 
     let count = targets.len();
     let mut errors = Vec::new();
+    let ep_ref = &ep;
     thread::scope(|s| {
         let handles: Vec<_> = targets
             .iter()
-            .map(|id| s.spawn(move || container_action(action, id)))
+            .map(|id| s.spawn(move || lifecycle_on(ep_ref, action, id)))
             .collect();
         for h in handles {
             if let Ok(Err(e)) = h.join() {
@@ -371,23 +449,7 @@ pub fn notify_watchdog(title: &str, body: &str) -> Result<String, String> {
 
 pub fn container_tail_logs(id: &str, tail: u32) -> Result<String, String> {
     validate_identifier(id)?;
-    if let Ok(text) = crate::docker_sock::tail_logs(id, tail) {
-        return Ok(text);
-    }
-    let engine = detect_engine().ok_or_else(|| "no container engine running".to_string())?;
-    let tail_str = tail.clamp(10, 500).to_string();
-    let out = Command::new(engine)
-        .args(["logs", "--tail", &tail_str, id])
-        .output()
-        .map_err(|e| format!("{engine} logs failed: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !out.stderr.is_empty() {
-        combined.push_str(&String::from_utf8_lossy(&out.stderr));
-    }
-    Ok(crate::docker_sock::strip_ansi(&combined))
+    tail_logs(id, tail)
 }
 
 pub fn switch_kube_context(context: &str) -> Result<String, String> {

@@ -46,6 +46,11 @@ else
   install -m 755 "${BUILT_BIN}" "${PLUGIN_DIR}/bin/devdock"
 fi
 
+echo "==> Recording verified binary checksum (bin/devdock.sha256)..."
+sha256sum "${PLUGIN_DIR}/bin/devdock" > "${PLUGIN_DIR}/bin/devdock.sha256"
+chmod 644 "${PLUGIN_DIR}/bin/devdock.sha256"
+echo "    source-hash: $("${PLUGIN_DIR}/bin/devdock" source-hash)"
+
 if command -v omarchy-plugin-validate >/dev/null 2>&1; then
   echo "==> Validating plugin manifest..."
   omarchy-plugin-validate "${PLUGIN_DIR}"

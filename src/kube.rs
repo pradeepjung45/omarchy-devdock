@@ -1,6 +1,8 @@
-//! Native zero-dependency `~/.kube/config` reader + PROD context safety guard
-//! + AWS profile inspection. Never makes network calls.
+//! Native zero-dependency kubeconfig reader + PROD context safety guard
+//! + AWS profile inspection. Merges all colon-separated `$KUBECONFIG` files
+//! using kubectl precedence rules. Never makes network calls.
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -31,8 +33,14 @@ impl KubeState {
             .or_else(|_| env::var("AWS_DEFAULT_PROFILE"))
             .unwrap_or_default();
 
-        let path = resolve_kubeconfig_path();
-        let Ok(raw) = fs::read_to_string(&path) else {
+        let paths = resolve_kubeconfig_paths();
+        let mut docs: Vec<String> = Vec::new();
+        for path in paths {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                docs.push(raw);
+            }
+        }
+        if docs.is_empty() {
             return Self {
                 available: false,
                 current_context: String::new(),
@@ -41,9 +49,10 @@ impl KubeState {
                 contexts: Vec::new(),
                 aws_profile,
             };
-        };
+        }
 
-        parse_kubeconfig(&raw, aws_profile)
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        merge_kubeconfigs(&refs, aws_profile)
     }
 
     pub fn to_json(&self) -> Json {
@@ -83,14 +92,20 @@ pub fn is_prod_name(name: &str) -> bool {
     false
 }
 
-fn resolve_kubeconfig_path() -> PathBuf {
-    if let Ok(kc) = env::var("KUBECONFIG")
-        && let Some(first) = kc.split(':').find(|s| !s.trim().is_empty())
-    {
-        return PathBuf::from(first.trim());
+fn resolve_kubeconfig_paths() -> Vec<PathBuf> {
+    if let Ok(kc) = env::var("KUBECONFIG") {
+        let list: Vec<PathBuf> = kc
+            .split(':')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !list.is_empty() {
+            return list;
+        }
     }
     let home = env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".kube").join("config")
+    vec![PathBuf::from(home).join(".kube").join("config")]
 }
 
 fn unquote(s: &str) -> String {
@@ -103,38 +118,62 @@ fn unquote(s: &str) -> String {
     t.to_string()
 }
 
-pub fn parse_kubeconfig(raw: &str, aws_profile: String) -> KubeState {
+struct ParsedKubeDoc {
+    current_context: String,
+    contexts: Vec<(String, String, String)>, // (name, namespace, cluster)
+    clusters: HashMap<String, String>,       // cluster_name -> server URL
+}
+
+fn parse_single_kubeconfig(raw: &str) -> ParsedKubeDoc {
     let mut current_context = String::new();
-    let mut contexts: Vec<KubeContext> = Vec::new();
-    let mut in_contexts = false;
+    let mut contexts: Vec<(String, String, String)> = Vec::new();
+    let mut clusters: HashMap<String, String> = HashMap::new();
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        None,
+        Contexts,
+        Clusters,
+    }
+
+    let mut section = Section::None;
     let mut cur_name = String::new();
     let mut cur_ns = String::new();
     let mut cur_cluster = String::new();
+    let mut cur_server = String::new();
     let mut has_item = false;
 
-    let flush = |has_item: &mut bool,
+    let flush = |section: Section,
+                 has_item: &mut bool,
                  cur_name: &mut String,
                  cur_ns: &mut String,
                  cur_cluster: &mut String,
-                 contexts: &mut Vec<KubeContext>| {
+                 cur_server: &mut String,
+                 contexts: &mut Vec<(String, String, String)>,
+                 clusters: &mut HashMap<String, String>| {
         if *has_item && !cur_name.is_empty() {
-            let ns = if cur_ns.is_empty() {
-                "default".to_string()
-            } else {
-                cur_ns.clone()
-            };
-            let prod = is_prod_name(cur_name) || is_prod_name(cur_cluster);
-            contexts.push(KubeContext {
-                name: cur_name.clone(),
-                namespace: ns,
-                cluster: cur_cluster.clone(),
-                is_prod: prod,
-            });
+            match section {
+                Section::Contexts => {
+                    let ns = if cur_ns.is_empty() {
+                        "default".to_string()
+                    } else {
+                        cur_ns.clone()
+                    };
+                    contexts.push((cur_name.clone(), ns, cur_cluster.clone()));
+                }
+                Section::Clusters => {
+                    clusters
+                        .entry(cur_name.clone())
+                        .or_insert_with(|| cur_server.clone());
+                }
+                Section::None => {}
+            }
         }
         *has_item = false;
         cur_name.clear();
         cur_ns.clear();
         cur_cluster.clear();
+        cur_server.clear();
     };
 
     for line in raw.lines() {
@@ -144,28 +183,50 @@ pub fn parse_kubeconfig(raw: &str, aws_profile: String) -> KubeState {
         }
         let indent = line.len() - line.trim_start().len();
 
-        if indent == 0 && !(in_contexts && stripped.starts_with("- ")) {
-            if in_contexts {
-                flush(&mut has_item, &mut cur_name, &mut cur_ns, &mut cur_cluster, &mut contexts);
-                in_contexts = false;
+        if indent == 0 && !(section != Section::None && stripped.starts_with("- ")) {
+            if section != Section::None {
+                flush(
+                    section,
+                    &mut has_item,
+                    &mut cur_name,
+                    &mut cur_ns,
+                    &mut cur_cluster,
+                    &mut cur_server,
+                    &mut contexts,
+                    &mut clusters,
+                );
+                section = Section::None;
             }
             if let Some(val) = stripped.strip_prefix("current-context:") {
                 current_context = unquote(val);
             } else if stripped == "contexts:" {
-                in_contexts = true;
+                section = Section::Contexts;
+            } else if stripped == "clusters:" {
+                section = Section::Clusters;
             }
             continue;
         }
 
-        if !in_contexts {
+        if section == Section::None {
             continue;
         }
 
         if let Some(rest) = stripped.strip_prefix("- ") {
-            flush(&mut has_item, &mut cur_name, &mut cur_ns, &mut cur_cluster, &mut contexts);
+            flush(
+                section,
+                &mut has_item,
+                &mut cur_name,
+                &mut cur_ns,
+                &mut cur_cluster,
+                &mut cur_server,
+                &mut contexts,
+                &mut clusters,
+            );
             has_item = true;
             if let Some(v) = rest.trim().strip_prefix("name:") {
                 cur_name = unquote(v);
+            } else if let Some(v) = rest.trim().strip_prefix("server:") {
+                cur_server = unquote(v);
             }
         } else if let Some(v) = stripped.strip_prefix("name:") {
             if cur_name.is_empty() {
@@ -175,11 +236,70 @@ pub fn parse_kubeconfig(raw: &str, aws_profile: String) -> KubeState {
             cur_ns = unquote(v);
         } else if let Some(v) = stripped.strip_prefix("cluster:") {
             cur_cluster = unquote(v);
+        } else if let Some(v) = stripped.strip_prefix("server:") {
+            cur_server = unquote(v);
         }
     }
-    if in_contexts {
-        flush(&mut has_item, &mut cur_name, &mut cur_ns, &mut cur_cluster, &mut contexts);
+    if section != Section::None {
+        flush(
+            section,
+            &mut has_item,
+            &mut cur_name,
+            &mut cur_ns,
+            &mut cur_cluster,
+            &mut cur_server,
+            &mut contexts,
+            &mut clusters,
+        );
     }
+
+    ParsedKubeDoc {
+        current_context,
+        contexts,
+        clusters,
+    }
+}
+
+/// Merge multiple kubeconfig YAML documents using kubectl's first-value-wins
+/// merge semantics: the first non-empty `current-context` wins, and contexts
+/// and clusters are unioned across all files (first definition per name wins).
+pub fn merge_kubeconfigs(docs: &[&str], aws_profile: String) -> KubeState {
+    let mut current_context = String::new();
+    let mut raw_contexts: Vec<(String, String, String)> = Vec::new();
+    let mut seen_contexts: HashSet<String> = HashSet::new();
+    let mut merged_clusters: HashMap<String, String> = HashMap::new();
+
+    for doc_str in docs {
+        let parsed = parse_single_kubeconfig(doc_str);
+        if current_context.is_empty() && !parsed.current_context.is_empty() {
+            current_context = parsed.current_context;
+        }
+        for (cname, server) in parsed.clusters {
+            merged_clusters.entry(cname).or_insert(server);
+        }
+        for (name, ns, cluster) in parsed.contexts {
+            if seen_contexts.insert(name.clone()) {
+                raw_contexts.push((name, ns, cluster));
+            }
+        }
+    }
+
+    let contexts: Vec<KubeContext> = raw_contexts
+        .into_iter()
+        .map(|(name, namespace, cluster)| {
+            let server = merged_clusters
+                .get(&cluster)
+                .map(String::as_str)
+                .unwrap_or("");
+            let is_prod = is_prod_name(&name) || is_prod_name(&cluster) || is_prod_name(server);
+            KubeContext {
+                name,
+                namespace,
+                cluster,
+                is_prod,
+            }
+        })
+        .collect();
 
     let current_entry = contexts.iter().find(|c| c.name == current_context);
     let current_namespace = current_entry
@@ -197,6 +317,11 @@ pub fn parse_kubeconfig(raw: &str, aws_profile: String) -> KubeState {
         contexts,
         aws_profile,
     }
+}
+
+#[cfg(test)]
+pub fn parse_kubeconfig(raw: &str, aws_profile: String) -> KubeState {
+    merge_kubeconfigs(&[raw], aws_profile)
 }
 
 #[cfg(test)]
@@ -231,6 +356,62 @@ users:
         assert!(state.contexts[0].is_prod);
         assert!(!state.contexts[1].is_prod);
         assert_eq!(state.aws_profile, "staging");
+    }
+
+    #[test]
+    fn merges_multiple_kubeconfig_files_and_catches_prod_in_later_files() {
+        let first_dev_only = r#"
+apiVersion: v1
+kind: Config
+contexts:
+- name: local-dev
+  context:
+    cluster: kind-dev
+    namespace: dev
+"#;
+        let second_selects_prod = r#"
+apiVersion: v1
+kind: Config
+current-context: primary
+contexts:
+- name: primary
+  context:
+    cluster: main-cluster
+    namespace: billing
+clusters:
+- name: main-cluster
+  cluster:
+    server: https://k8s.prod.internal.example:6443
+"#;
+        let state = merge_kubeconfigs(&[first_dev_only, second_selects_prod], String::new());
+        assert!(state.available);
+        assert_eq!(state.current_context, "primary");
+        assert_eq!(state.current_namespace, "billing");
+        assert!(state.current_is_prod);
+        assert_eq!(state.contexts.len(), 2);
+    }
+
+    #[test]
+    fn first_non_empty_current_context_wins_while_merging_context_definitions() {
+        let first_sets_ctx = r#"
+apiVersion: v1
+kind: Config
+current-context: shared-ctx
+"#;
+        let second_defines_prod_ctx = r#"
+apiVersion: v1
+kind: Config
+current-context: local-dev
+contexts:
+- name: shared-ctx
+  context:
+    cluster: eks-production-eu
+    namespace: core
+"#;
+        let state = merge_kubeconfigs(&[first_sets_ctx, second_defines_prod_ctx], String::new());
+        assert_eq!(state.current_context, "shared-ctx");
+        assert!(state.current_is_prod);
+        assert_eq!(state.current_namespace, "core");
     }
 
     #[test]

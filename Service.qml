@@ -12,6 +12,7 @@ Item {
   property bool initialized: false
   property bool refreshing: false
   property bool binaryMissing: false
+  property string binaryStatusDetail: ""
   property string resolvedBinary: ""
   property string statusText: "Scanning..."
   property string toastText: ""
@@ -65,7 +66,8 @@ Item {
   property string _rdnsIp: ""
   property string _rdnsStdout: ""
 
-  property int _probeIndex: 0
+  property bool _verifyingBinary: false
+  property string _verifyHashStdout: ""
   property bool _scanInFlight: false
   property string _scanStdout: ""
   property string _scanStderr: ""
@@ -77,21 +79,17 @@ Item {
   property string _ctrActionLabel: ""
   property string _ctrActionStdout: ""
   property string _ctrActionStderr: ""
+  property int _logRequestSeq: 0
+  property int _logInFlightSeq: 0
+  property string _logInFlightId: ""
+  property bool _logPendingRefetch: false
   property string _logStdout: ""
   property string _logStderr: ""
 
-  readonly property var _candidates: {
-    var home = String(Quickshell.env("HOME") || "")
-    var bundled = Qt.resolvedUrl("bin/devdock").toString().replace(/^file:\/\//, "")
-    var list = []
-    if (bundled !== "") list.push(bundled)
-    if (home !== "") {
-      list.push(home + "/.local/bin/devdock")
-      list.push(home + "/.cargo/bin/devdock")
-    }
-    list.push("devdock")
-    return list
-  }
+  // Strictly execute only the plugin-private binary built locally from this
+  // reviewed source tree and verified by bin/devdock.sha256 + EXPECTED_SOURCE_SHA256.
+  readonly property string bundledBinary: Qt.resolvedUrl("bin/devdock").toString().replace(/^file:\/\//, "")
+  readonly property string bundledChecksum: bundledBinary !== "" ? (bundledBinary + ".sha256") : ""
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -128,40 +126,50 @@ Item {
   function retryProbe() {
     resolvedBinary = ""
     binaryMissing = false
-    _probeIndex = 0
+    binaryStatusDetail = ""
+    _verifyingBinary = false
     refresh()
+  }
+
+  function _failBinaryVerification(reason) {
+    _verifyingBinary = false
+    resolvedBinary = ""
+    binaryMissing = true
+    binaryStatusDetail = String(reason || "Build the local Rust backend from this plugin's source tree.")
+    initialized = true
+    refreshing = false
+    statusText = "devdock backend needs local build"
+  }
+
+  function _startBinaryVerification() {
+    if (_verifyingBinary || verifyChecksumProcess.running || verifySourceProcess.running) return
+    if (bundledBinary === "" || bundledChecksum === "") {
+      _failBinaryVerification("Plugin binary path unavailable.")
+      return
+    }
+    _verifyingBinary = true
+    refreshing = true
+    verifyChecksumProcess.command = ["sha256sum", "-c", "--status", bundledChecksum]
+    verifyChecksumProcess.running = true
   }
 
   function refresh() {
     if (scanProcess.running || _scanInFlight) return
-    var bin = resolvedBinary
-    if (bin === "") {
-      if (_probeIndex >= _candidates.length) {
-        binaryMissing = true
-        initialized = true
-        statusText = "devdock binary not found"
-        return
-      }
-      bin = _candidates[_probeIndex]
+    if (resolvedBinary === "") {
+      _startBinaryVerification()
+      return
     }
     _scanStdout = ""
     _scanStderr = ""
     _scanInFlight = true
     refreshing = true
-    scanProcess.command = [bin, "scan"]
+    scanProcess.command = [resolvedBinary, "scan"]
     scanProcess.running = true
   }
 
-  function _handleProbeFailure() {
-    if (resolvedBinary !== "") return
-    _probeIndex += 1
-    if (_probeIndex < _candidates.length) {
-      Qt.callLater(function() { root.refresh() })
-    } else {
-      binaryMissing = true
-      initialized = true
-      statusText = "devdock binary not found"
-    }
+  function _handleScanFailure() {
+    resolvedBinary = ""
+    _failBinaryVerification("Verified binary failed to run — rebuild via bash ./install.sh.")
   }
 
   function runAction(args, label, shouldRefresh) {
@@ -278,6 +286,12 @@ Item {
     runAction(["copy", String(text)], label ? ("Copied " + label) : "Copied to clipboard", false)
   }
 
+  function copyContainerLogs(id, name) {
+    var cid = String(id || "")
+    if (cid === "") return
+    runAction(["copy-container-logs", cid, "120"], "Copied " + String(name || cid) + " logs", false)
+  }
+
   function containerAction(verb, id, name) {
     var cid = String(id || "")
     var cname = String(name || cid)
@@ -301,40 +315,60 @@ Item {
     containerActionProcess.running = true
   }
 
-  function composeStackAction(verb, project) {
+  function composeStackAction(verb, project, targetIds) {
     var proj = String(project || "")
-    if (proj === "" || resolvedBinary === "") return
+    var ids = Array.isArray(targetIds) ? targetIds : []
+    if (proj === "" || resolvedBinary === "" || ids.length === 0) return
     if (verb === "stop") {
-      var items = (containers && Array.isArray(containers.items)) ? containers.items : []
-      for (var i = 0; i < items.length; i++) {
-        if (items[i] && String(items[i].composeProject || "") === proj) {
-          _markManualStop("ctr:" + items[i].id)
-        }
+      for (var i = 0; i < ids.length; i++) {
+        _markManualStop("ctr:" + String(ids[i]))
       }
     }
-    runAction(["stack", String(verb), proj], (verb === "start" ? "Starting stack " : "Stopping stack ") + proj, true)
+    var args = ["stack", String(verb), proj]
+    for (var j = 0; j < ids.length; j++) args.push(String(ids[j]))
+    runAction(args, (verb === "start" ? "Starting stack " : "Stopping stack ") + proj, true)
   }
 
   function openInlineLogs(id, name) {
-    logContainerId = String(id || "")
-    logContainerName = String(name || id || "")
+    var nextId = String(id || "")
+    _logRequestSeq += 1
+    logContainerId = nextId
+    logContainerName = String(name || nextId)
     logError = ""
     logText = ""
+    if (logTailProcess.running) {
+      _logPendingRefetch = true
+      logTailProcess.running = false
+      return
+    }
+    _logPendingRefetch = false
     fetchInlineLogs()
   }
 
   function closeInlineLogs() {
+    _logRequestSeq += 1
+    _logPendingRefetch = false
     logContainerId = ""
     logContainerName = ""
     logText = ""
     logError = ""
     logLoading = false
+    if (logTailProcess.running) logTailProcess.running = false
   }
 
   function fetchInlineLogs() {
-    if (resolvedBinary === "" || logContainerId === "" || logTailProcess.running) return
+    if (resolvedBinary === "" || logContainerId === "") return
+    if (logTailProcess.running) {
+      if (_logInFlightId !== logContainerId) {
+        _logPendingRefetch = true
+        logTailProcess.running = false
+      }
+      return
+    }
     _logStdout = ""
     _logStderr = ""
+    _logInFlightSeq = _logRequestSeq
+    _logInFlightId = logContainerId
     logLoading = true
     logTailProcess.command = [resolvedBinary, "container-tail", logContainerId, "120"]
     logTailProcess.running = true
@@ -400,6 +434,54 @@ Item {
   }
 
   Process {
+    id: verifyChecksumProcess
+    running: false
+    command: []
+
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root._verifyHashStdout = ""
+        verifySourceProcess.command = [root.bundledBinary, "source-hash"]
+        verifySourceProcess.running = true
+      } else {
+        root._failBinaryVerification("Plugin binary missing or checksum mismatch (bin/devdock.sha256) — build from source with bash ./install.sh.")
+      }
+    }
+
+    onRunningChanged: {
+      if (!running && root._verifyingBinary && !verifySourceProcess.running && root.resolvedBinary === "") {
+        root._failBinaryVerification("Unable to verify bin/devdock.sha256 — build from source with bash ./install.sh.")
+      }
+    }
+  }
+
+  Process {
+    id: verifySourceProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: verifyHashStdout; waitForEnd: true; onStreamFinished: root._verifyHashStdout = text }
+
+    onExited: function(exitCode) {
+      root._verifyingBinary = false
+      var actual = String(verifyHashStdout.text || root._verifyHashStdout || "").trim()
+      if (exitCode === 0 && actual === Model.EXPECTED_SOURCE_SHA256) {
+        root.resolvedBinary = root.bundledBinary
+        root.binaryMissing = false
+        root.binaryStatusDetail = ""
+        Qt.callLater(function() { root.refresh() })
+      } else {
+        root._failBinaryVerification("Installed binary does not match this reviewed source digest — rebuild with bash ./install.sh.")
+      }
+    }
+
+    onRunningChanged: {
+      if (!running && root._verifyingBinary && root.resolvedBinary === "") {
+        root._failBinaryVerification("Verified binary could not be executed — rebuild with bash ./install.sh.")
+      }
+    }
+  }
+
+  Process {
     id: scanProcess
     running: false
     command: []
@@ -413,9 +495,6 @@ Item {
       if (exitCode === 0) {
         var parsed = Model.parseSnapshot(out)
         if (parsed.ok) {
-          if (root.resolvedBinary === "" && root._probeIndex < root._candidates.length) {
-            root.resolvedBinary = root._candidates[root._probeIndex]
-          }
           root.binaryMissing = false
           root.initialized = true
           // Compute live RX/TX throughput from /proc/net/dev counter deltas
@@ -440,14 +519,14 @@ Item {
           return
         }
       }
-      root._handleProbeFailure()
+      root._handleScanFailure()
     }
 
     onRunningChanged: {
       if (!running && root._scanInFlight) {
         root._scanInFlight = false
         root.refreshing = false
-        root._handleProbeFailure()
+        root._handleScanFailure()
       }
     }
   }
@@ -485,14 +564,21 @@ Item {
     stderr: StdioCollector { id: logStderr; waitForEnd: true; onStreamFinished: root._logStderr = text }
 
     onExited: function(exitCode) {
+      var stale = root._logInFlightSeq !== root._logRequestSeq || root._logInFlightId !== root.logContainerId
       root.logLoading = false
-      var out = String(logStdout.text || root._logStdout || "")
-      var err = String(logStderr.text || root._logStderr || "").trim()
-      if (exitCode === 0) {
-        root.logError = ""
-        root.logText = out.trim() !== "" ? out : "(no log output yet)"
-      } else {
-        root.logError = err !== "" ? err : "Failed to read container logs"
+      if (!stale && root.logContainerId !== "") {
+        var out = String(logStdout.text || root._logStdout || "")
+        var err = String(logStderr.text || root._logStderr || "").trim()
+        if (exitCode === 0) {
+          root.logError = ""
+          root.logText = out.trim() !== "" ? out : "(no log output yet)"
+        } else {
+          root.logError = err !== "" ? err : "Failed to read container logs"
+        }
+      }
+      if (root._logPendingRefetch && root.logContainerId !== "") {
+        root._logPendingRefetch = false
+        Qt.callLater(function() { root.fetchInlineLogs() })
       }
     }
   }

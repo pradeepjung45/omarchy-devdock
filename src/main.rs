@@ -280,14 +280,16 @@ fn print_usage() {
            net-stop <pid>                          Send SIGTERM to owned process from Net view\n\
            focus <pid>                             Focus Hyprland window owning <pid>\n\
            open <url>                              Open validated local/LAN URL in browser\n\
-           copy <text>                             Copy text to Wayland clipboard\n\
+           copy <text|--stdin>                     Copy text to Wayland clipboard\n\
+           copy-container-logs <id> [lines]        Copy container logs via stdin pipe\n\
            container <start|stop|restart|logs|exec> <id>\n\
            container-tail <id> [lines]             Direct UNIX-socket container log tail\n\
-           stack <start|stop> <compose-project>    Start or stop an entire Compose stack\n\
+           stack <start|stop> <project> [ids...]   Start or stop Compose stack on local socket\n\
            k8s-switch <context>                    Switch active kubectl context\n\
            service-logs <unit> [--user]            Follow journalctl logs in terminal\n\
            rdns <ip>                               On-demand reverse DNS lookup\n\
-           notify <title> <body>                   Send crash-watchdog desktop notification"
+           notify <title> <body>                   Send crash-watchdog desktop notification\n\
+           source-hash                             Print compile-time SHA-256 of Rust sources"
     );
 }
 
@@ -333,11 +335,15 @@ fn main() -> ExitCode {
                 }
             }
         }
+        "source-hash" => {
+            println!("{}", env!("DEVDOCK_SOURCE_SHA256"));
+            return ExitCode::SUCCESS;
+        }
         "stack" => {
             if args.len() < 3 {
-                Err("usage: devdock stack <start|stop> <compose-project>".into())
+                Err("usage: devdock stack <start|stop> <compose-project> [ids...]".into())
             } else {
-                actions::compose_stack_action(&args[1], &args[2])
+                actions::compose_stack_action(&args[1], &args[2], &args[3..])
             }
         }
         "notify" => {
@@ -376,9 +382,19 @@ fn main() -> ExitCode {
         }
         "copy" => {
             if args.len() < 2 {
-                Err("usage: devdock copy <text>".into())
+                Err("usage: devdock copy <text|--stdin>".into())
+            } else if args[1] == "--stdin" {
+                actions::copy_stdin()
             } else {
                 actions::copy_text(&args[1])
+            }
+        }
+        "copy-container-logs" => {
+            if args.len() < 2 {
+                Err("usage: devdock copy-container-logs <id> [lines]".into())
+            } else {
+                let tail = args.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(120);
+                actions::copy_container_logs(&args[1], tail)
             }
         }
         "container" => {

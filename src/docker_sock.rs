@@ -17,6 +17,19 @@ pub struct SocketEndpoint {
     pub path: PathBuf,
 }
 
+impl SocketEndpoint {
+    /// Return CLI flags pinning docker/podman strictly to this local UNIX socket
+    /// so `DOCKER_HOST` or an active remote CLI context can never be used.
+    pub fn cli_host_args(&self) -> Vec<String> {
+        let uri = format!("unix://{}", self.path.display());
+        if self.engine == "podman" {
+            vec!["--url".into(), uri]
+        } else {
+            vec!["-H".into(), uri]
+        }
+    }
+}
+
 pub fn detect_socket() -> Option<SocketEndpoint> {
     if Path::new("/run/docker.sock").exists() {
         return Some(SocketEndpoint {
@@ -158,6 +171,10 @@ pub fn decode_chunked(input: &[u8]) -> Vec<u8> {
 
 pub fn list_containers() -> Result<ContainersState, String> {
     let ep = detect_socket().ok_or_else(|| "no container socket".to_string())?;
+    list_containers_on(&ep)
+}
+
+pub fn list_containers_on(ep: &SocketEndpoint) -> Result<ContainersState, String> {
     let resp = unix_http_request(&ep.path, "GET", "/containers/json?all=1", 3)?;
     if resp.status != 200 {
         return Err(format!("daemon returned HTTP {}", resp.status));
@@ -269,8 +286,7 @@ pub fn parse_docker_api_containers(raw: &str, engine: &str) -> Result<Containers
     })
 }
 
-pub fn lifecycle(action: &str, id: &str) -> Result<String, String> {
-    let ep = detect_socket().ok_or_else(|| "no container socket".to_string())?;
+pub fn lifecycle_on(ep: &SocketEndpoint, action: &str, id: &str) -> Result<String, String> {
     let path = match action {
         "start" => format!("/containers/{id}/start"),
         "stop" => format!("/containers/{id}/stop?t=5"),
@@ -293,6 +309,10 @@ pub fn lifecycle(action: &str, id: &str) -> Result<String, String> {
 
 pub fn tail_logs(id: &str, tail: u32) -> Result<String, String> {
     let ep = detect_socket().ok_or_else(|| "no container socket".to_string())?;
+    tail_logs_on(&ep, id, tail)
+}
+
+pub fn tail_logs_on(ep: &SocketEndpoint, id: &str, tail: u32) -> Result<String, String> {
     let safe_tail = tail.clamp(10, 500);
     let path = format!("/containers/{id}/logs?stdout=1&stderr=1&tail={safe_tail}");
     let resp = unix_http_request(&ep.path, "GET", &path, 5)?;

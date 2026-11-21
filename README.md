@@ -18,22 +18,22 @@ Powered by a single ~720 KB native Rust binary compiled strictly against `std` (
 - Separates IDE/Gradle/desktop IPC ports into a collapsible **Background, IDE & System** drawer.
 
 ### 2. Docker & Podman + Inline Logs (`2`)
-- Talks **HTTP/1.1 directly over `/run/docker.sock` or Podman UNIX sockets** in Rust — eliminating cold Go CLI startup lag.
-- **Docker Compose Stack Grouping**: Automatically detects `com.docker.compose.project` stacks with 1-click **Start Stack** / **Stop Stack**.
-- **Zero-lag optimistic Start / Stop / Restart** per container + **1-click Interactive Shell (`exec sh`)**.
-- **Instant Inline Log Viewer (~2 ms)** right inside the popup (decodes Docker's 8-byte multiplexed stdout/stderr frame headers, strips ANSI codes, supports **Live ●** auto-tail and 1-click Copy) + detached **Pop out in Terminal** (`setsid foot -H` / `alacritty --hold` / `kitty --hold` / `ghostty`).
+- Talks **HTTP/1.1 strictly over the local `/run/docker.sock` or Podman UNIX socket** in Rust — eliminating cold Go CLI startup lag and never silently switching to a remote `DOCKER_HOST` or CLI context on local daemon failure.
+- **Docker Compose Stack Grouping**: Detects `com.docker.compose.project` stacks with 1-click **Start Stack** / **Stop Stack** pinned to the exact verified container IDs on the local socket.
+- **Zero-lag optimistic Start / Stop / Restart** per container + **1-click Interactive Shell (`exec sh`)** pinned to the local UNIX socket (`-H unix://...` / `--url unix://...`).
+- **Instant Inline Log Viewer (~2 ms)** right inside the popup (decodes Docker's 8-byte multiplexed stdout/stderr frame headers, strips ANSI codes, supports **Live ●** auto-tail, and copies logs directly via stdin pipe so log text never appears in process arguments) + detached **Pop out in Terminal** (`setsid foot -H` / `alacritty --hold` / `kitty --hold` / `ghostty`).
 - **Crash Watchdog**: Optional desktop notifications (`notify-send`) when a running dev server or container exits unexpectedly.
 
 ### 3. Live Internet Traffic & OS Security Radar (`3`)
 - **Live Throughput HUD**: Real-time `↓ RX / ↑ TX` rates from `/proc/net/dev` across Wi-Fi, Ethernet, VPN, and Docker bridges.
 - **Process-Attributed Connections**: Maps every active `ESTABLISHED` / `SYN` internet & LAN socket to its owning process (`comm`, `pid`, `exe`) with Inbound (`↙`) vs Outbound (`↗`), protocol tags (`HTTPS`, `HTTP`, `SSH`, `DNS`, DBs), **1-click on-demand Reverse DNS (`rDNS`)**, **Jump to Window**, safe UID-verified **Stop Process**, and **critical alerts** if a deleted or `/tmp`/`/dev/shm` binary calls the internet.
-- **11 Self-Contained OS Hardening Checks (Zero Root)**: UFW/nftables firewall, LUKS encryption, ASLR, Yama ptrace, eBPF lock, `kptr`/`dmesg` isolation, `rp_filter`, Arch kernel-reboot drift, SSH `:22` exposure, `0.0.0.0` local DB/broker guard, and runtime traffic anomalies.
+- **11 Self-Contained OS Hardening Checks (Zero Root)**: Live systemd firewall verification (`ufw.service` / `nftables.service` / `firewalld.service`), kernel-verified LUKS dm-crypt root check (`/proc/self/mountinfo` + `/sys/class/block/*/dm/uuid`), ASLR, Yama ptrace, eBPF lock, `kptr`/`dmesg` isolation, `rp_filter`, Arch kernel-reboot drift, SSH `:22` exposure, `0.0.0.0` local DB/broker guard, and runtime traffic anomalies.
 
 ### 4. Infra — Kubernetes & Systemd (`4`)
-- Native `~/.kube/config` / `$KUBECONFIG` parser (zero network calls) with a persistent red **`PROD` context warning** on both the bar icon and popup header, 1-click context switching, and `AWS_PROFILE` badge.
+- Native multi-file `$KUBECONFIG` / `~/.kube/config` merger (follows kubectl merge precedence, zero network calls) with a persistent red **`PROD` context warning** on both the bar icon and popup header, 1-click context switching, and `AWS_PROFILE` badge.
 - Failed system & user systemd unit alerts + installed DevOps daemon health with 1-click `journalctl` logs.
 
-### 5. Interactive Arch OS Architecture Map (`5`)
+### 5. Interactive Arch OS Architecture Map (`5`) & 16 Color Palettes (`t`)
 - Live 6-layer interactive diagram built straight from `/proc`, `/sys`, Hyprland IPC, and `/var/lib/pacman/local`:
   1. **Silicon & Storage**: CPU model/cores/governor, DRM GPU driver + PCI ID, live storage chain (`nvme0n1 → LUKS dm-crypt → btrfs (zstd:3) → zram0`), Btrfs subvolumes, and swap.
   2. **Linux Kernel**: Release, preemption model, loaded modules count, installed kernels, active LSM stack, and taint status.
@@ -41,6 +41,7 @@ Powered by a single ~720 KB native Rust binary compiled strictly against `std` (
   4. **Wayland & Omarchy**: Compositor & shell memory footprint, PipeWire audio, and live connected displays.
   5. **Network & Container Fabrics**: Live NICs, firewall, and Docker bridges with RX/TX counters.
   6. **Arch Pacman & Top Workloads**: Instant local package count, last sync timestamp, and proportional **Top 6 RAM consumer** bars.
+- **16 Live Color Palettes (`󰏘` / `t`)**: `Auto` (live Omarchy `colors.toml`), `Crimson`, `Bloodline`, `Cyber`, `Matrix`, `Synthwave`, `Amber`, `Tokyo`, `Catppuccin`, `Rosé Pine`, `Dracula`, `Kanagawa`, `Everforest`, `Nord`, `Gruvbox`, and `Mono` — persisted cleanly via Omarchy's `updateEntryInline`.
 
 ---
 
@@ -49,9 +50,10 @@ Powered by a single ~720 KB native Rust binary compiled strictly against `std` (
 | Key | Action |
 | --- | --- |
 | `1` `2` `3` `4` `5` | Switch tabs (Ports / Docker / Net / Infra / Arch OS) |
+| `t` | Toggle the 16-theme Color Palette picker |
 | `/` | Focus instant filter search |
 | `r` | Refresh snapshot immediately |
-| `Esc` | Close inline logs, clear search, or close popup |
+| `Esc` | Close palette picker, inline logs, clear search, or close popup |
 | `Tab` | Cycle Omarchy bar panels |
 
 ---
@@ -77,14 +79,14 @@ devdock rdns 1.1.1.1                        # On-demand reverse DNS lookup
 
 ### Via Omarchy Plugin Manager (Recommended)
 
-Install through the Omarchy plugin catalog (`io.github.pradeepjung45.devdock`), then build the zero-dependency Rust backend once (requires `cargo`):
+Install through the Omarchy plugin catalog (`io.github.pradeepjung45.devdock`), then build the zero-dependency Rust backend locally from the installed plugin's audited source (requires `cargo`):
 
 ```bash
 cd ~/.config/omarchy/plugins/io.github.pradeepjung45.devdock
 bash ./install.sh
 ```
 
-Or download the prebuilt `devdock-linux-x86_64` binary from [GitHub Releases](https://github.com/pradeepjung45/omarchy-devdock/releases), verify `SHA256SUMS.txt`, and place it at `~/.local/bin/devdock` (`chmod +x ~/.local/bin/devdock`).
+`install.sh` compiles with `cargo build --release --locked`, installs the plugin-private binary to `bin/devdock`, and writes `bin/devdock.sha256`. On startup, `Service.qml` exclusively executes `bin/devdock` after verifying both `bin/devdock.sha256` and the compile-time source digest pinned in `Model.js` (`EXPECTED_SOURCE_SHA256`). No prebuilt binaries are downloaded.
 
 ### Toggle via Keybinding or CLI
 

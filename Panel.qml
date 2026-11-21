@@ -25,12 +25,29 @@ Panel {
   property string expandedTrafficKey: ""
   property string expandedArchLayer: "workloads" // "hw" | "kernel" | "init" | "session" | "fabrics" | "workloads" | ""
   property string armedKillKey: ""
+  property bool showPalettePicker: false
+  property string colorSchemeOverride: ""
 
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color accent: Commons.Color.accent
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  // Live Omarchy theme-synced + user-selectable semantic palette
+  readonly property string activeColorScheme: colorSchemeOverride !== ""
+    ? colorSchemeOverride
+    : String(root.setting("colorScheme", "Auto") || "Auto")
+  readonly property var _pal: Model.resolvePalette(
+    activeColorScheme,
+    (devdock.host && devdock.host.palette) ? devdock.host.palette : ({})
+  )
+  readonly property color okColor: (_pal.green && _pal.green !== "") ? _pal.green : root.accent
+  readonly property color warnColor: (_pal.amber && _pal.amber !== "") ? _pal.amber : root.accent
+  readonly property color infoColor: (_pal.blue && _pal.blue !== "") ? _pal.blue : root.accent
+  readonly property color purpleColor: (_pal.purple && _pal.purple !== "") ? _pal.purple : root.accent
+  readonly property color cyanColor: (_pal.cyan && _pal.cyan !== "") ? _pal.cyan : root.accent
+  readonly property color dangerColor: (_pal.red && _pal.red !== "") ? _pal.red : root.urgent
 
   readonly property bool barIsUrgent: Model.barUrgent(devdock.summary)
   readonly property bool barIsActive: Model.barActive(devdock.summary)
@@ -86,6 +103,26 @@ Panel {
     root.close()
   }
 
+  function persistSettings(values) {
+    var entry = { id: root.moduleName }
+    if (root.settings) {
+      for (var existing in root.settings) {
+        if (existing !== "id") entry[existing] = root.settings[existing]
+      }
+    }
+    for (var key in values) entry[key] = values[key]
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function") {
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+    }
+  }
+
+  function selectColorScheme(name) {
+    var scheme = String(name || "Auto")
+    root.colorSchemeOverride = scheme
+    persistSettings({ colorScheme: scheme })
+  }
+
   Timer {
     id: killArmTimer
     interval: 4500
@@ -107,6 +144,15 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
+    function openTab(name: string): string {
+      var t = String(name || "").toLowerCase()
+      if (t === "ports" || t === "containers" || t === "netsec" || t === "infra" || t === "arch") {
+        root.activeTab = t
+        root.open()
+        return t
+      }
+      return "invalid"
+    }
     function refresh(): string { devdock.refresh(); return "ok" }
     function status(): string { return devdock.statusText }
   }
@@ -135,8 +181,8 @@ Panel {
       DevDockIcon {
         iconSize: Math.round(Style.bar.iconSize)
         strokeColor: root.barForeground
-        accentColor: root.accent
-        urgentColor: root.urgent
+        accentColor: root.okColor
+        urgentColor: root.dangerColor
         active: root.barIsActive
         urgent: root.barIsUrgent
         anchors.verticalCenter: parent.verticalCenter
@@ -174,7 +220,9 @@ Panel {
       anchors.fill: parent
 
       onCloseRequested: {
-        if (devdock.logContainerId !== "") {
+        if (root.showPalettePicker) {
+          root.showPalettePicker = false
+        } else if (devdock.logContainerId !== "") {
           devdock.closeInlineLogs()
         } else if (root.searchQuery !== "") {
           root.searchQuery = ""
@@ -187,6 +235,7 @@ Panel {
       onTextKey: function(t) {
         if (searchField.activeFocus) return
         if (t === "r" || t === "R") devdock.refresh()
+        else if (t === "t" || t === "T") root.showPalettePicker = !root.showPalettePicker
         else if (t === "/") searchField.forceActiveFocus()
         else if (t === "1") root.activeTab = "ports"
         else if (t === "2") root.activeTab = "containers"
@@ -219,8 +268,8 @@ Panel {
             DevDockIcon {
               iconSize: Style.space(22)
               strokeColor: root.foreground
-              accentColor: root.accent
-              urgentColor: root.urgent
+              accentColor: root.okColor
+              urgentColor: root.dangerColor
               active: root.barIsActive
               urgent: root.barIsUrgent
               Layout.alignment: Qt.AlignVCenter
@@ -246,7 +295,7 @@ Panel {
                 PillBadge {
                   visible: devdock.host.hostname !== ""
                   label: devdock.host.hostname
-                  badgeColor: root.dim
+                  badgeColor: root.purpleColor
                 }
 
                 Item { Layout.fillWidth: true }
@@ -267,12 +316,135 @@ Panel {
             }
 
             PanelActionButton {
+              iconText: "󰏘"
+              tooltipText: "Color palette: " + root.activeColorScheme + " (t)"
+              foreground: root.showPalettePicker ? root.purpleColor : root.foreground
+              hoverColor: root.purpleColor
+              fontFamily: root.fontFamily
+              onClicked: root.showPalettePicker = !root.showPalettePicker
+            }
+
+            PanelActionButton {
               iconText: "󰑐"
               tooltipText: "Refresh (r)"
               foreground: root.foreground
               fontFamily: root.fontFamily
               enabled: !devdock.refreshing
               onClicked: devdock.binaryMissing ? devdock.retryProbe() : devdock.refresh()
+            }
+          }
+
+          // ── Color Palette Picker Drawer ─────────────────────────────────
+          BorderSurface {
+            visible: root.showPalettePicker
+            width: parent.width
+            implicitHeight: palCol.implicitHeight + Style.space(14)
+            radius: Style.cornerRadius
+            color: Util.alpha(root.purpleColor, 0.08)
+            borderSpec: Border.controlSpec("selected", Util.alpha(root.purpleColor, 0.55), root.purpleColor)
+
+            Column {
+              id: palCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(8)
+              spacing: Style.space(6)
+
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(6)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "󰏘 COLOR PALETTE"
+                  color: root.purpleColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                Item { Layout.fillWidth: true }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: Model.schemeMeta(root.activeColorScheme).label + " · " + Model.schemeMeta(root.activeColorScheme).desc
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Flow {
+                width: parent.width
+                spacing: Style.space(5)
+
+                Repeater {
+                  model: Model.COLOR_SCHEMES
+                  BorderSurface {
+                    id: swatchBtn
+                    required property var modelData
+                    readonly property bool selected: root.activeColorScheme === modelData.id
+                    readonly property var previewPal: modelData.id === "Auto"
+                      ? Model.resolvePalette("Auto", (devdock.host && devdock.host.palette) ? devdock.host.palette : ({}))
+                      : modelData
+                    implicitWidth: swatchRow.implicitWidth + Style.space(12)
+                    implicitHeight: swatchRow.implicitHeight + Style.space(8)
+                    radius: Style.cornerRadius
+                    color: swatchBtn.selected
+                      ? Util.alpha(root.purpleColor, 0.22)
+                      : (swatchMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accent) : Util.alpha(Commons.Color.background, 0.45))
+                    borderSpec: swatchBtn.selected
+                      ? Border.controlSpec("selected", root.purpleColor, root.purpleColor)
+                      : Border.controlSpec("normal", Qt.darker(root.foreground, 2.2), root.purpleColor)
+
+                    Row {
+                      id: swatchRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(4)
+
+                      Row {
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: Style.space(2)
+
+                        Rectangle {
+                          width: Style.space(6); height: Style.space(6); radius: Style.space(3)
+                          color: swatchBtn.previewPal.green !== "" ? swatchBtn.previewPal.green : root.accent
+                        }
+                        Rectangle {
+                          width: Style.space(6); height: Style.space(6); radius: Style.space(3)
+                          color: swatchBtn.previewPal.cyan !== "" ? swatchBtn.previewPal.cyan : root.foreground
+                        }
+                        Rectangle {
+                          width: Style.space(6); height: Style.space(6); radius: Style.space(3)
+                          color: swatchBtn.previewPal.purple !== "" ? swatchBtn.previewPal.purple : root.dim
+                        }
+                        Rectangle {
+                          width: Style.space(6); height: Style.space(6); radius: Style.space(3)
+                          color: swatchBtn.previewPal.amber !== "" ? swatchBtn.previewPal.amber : root.urgent
+                        }
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: swatchBtn.modelData.label
+                        color: swatchBtn.selected ? root.foreground : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: swatchBtn.selected
+                      }
+                    }
+
+                    MouseArea {
+                      id: swatchMouse
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.selectColorScheme(swatchBtn.modelData.id)
+                    }
+                  }
+                }
+              }
             }
           }
 
@@ -285,18 +457,21 @@ Panel {
             CopyChip {
               visible: devdock.host.lanIp !== ""
               label: "LAN " + devdock.host.lanIp
+              chipColor: root.cyanColor
               onClicked: devdock.copyText(devdock.host.lanIp, devdock.host.lanIp)
             }
 
             CopyChip {
               visible: devdock.host.tailscaleIp !== ""
               label: "TS " + devdock.host.tailscaleIp
+              chipColor: root.okColor
               onClicked: devdock.copyText(devdock.host.tailscaleIp, devdock.host.tailscaleIp)
             }
 
             CopyChip {
               visible: devdock.kube.awsProfile !== ""
               label: "AWS " + devdock.kube.awsProfile
+              chipColor: root.warnColor
               onClicked: devdock.copyText(devdock.kube.awsProfile, "AWS_PROFILE")
             }
           }
@@ -380,7 +555,7 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 width: parent.width
-                text: "Rust backend binary 'devdock' not found"
+                text: "DevDock Rust backend needs local build"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -391,7 +566,7 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 width: parent.width
-                text: "Build the zero-dependency Rust backend once to enable /proc port radar, UNIX-socket Docker, live Net & Security, and the Arch OS map:\n\n  " + devdock.setupCommand
+                text: (devdock.binaryStatusDetail !== "" ? (devdock.binaryStatusDetail + "\n\n") : "Build the zero-dependency Rust backend locally from this plugin's audited source:\n\n") + "  " + devdock.setupCommand
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -444,6 +619,7 @@ Panel {
               label: "Ports"
               badge: String(Number(devdock.summary.devPorts || 0) + Number(devdock.summary.tunnels || 0))
               active: root.activeTab === "ports"
+              tabColor: root.infoColor
               urgentBadge: false
               onClicked: root.activeTab = "ports"
             }
@@ -455,6 +631,7 @@ Panel {
                 ? (devdock.containers.runningCount + "/" + devdock.containers.items.length)
                 : "-"
               active: root.activeTab === "containers"
+              tabColor: root.cyanColor
               urgentBadge: false
               onClicked: root.activeTab = "containers"
             }
@@ -466,6 +643,7 @@ Panel {
                 ? ("!" + devdock.security.criticalCount)
                 : String(devdock.traffic.internetConns || 0)
               active: root.activeTab === "netsec"
+              tabColor: root.okColor
               urgentBadge: devdock.security.criticalCount > 0
               onClicked: root.activeTab = "netsec"
             }
@@ -479,6 +657,7 @@ Panel {
                   ? ("!" + devdock.services.failedCount)
                   : String(devdock.services.daemons.length))
               active: root.activeTab === "infra"
+              tabColor: root.warnColor
               urgentBadge: devdock.kube.currentIsProd === true || devdock.services.failedCount > 0
               onClicked: root.activeTab = "infra"
             }
@@ -488,6 +667,7 @@ Panel {
               label: "Arch"
               badge: "OS"
               active: root.activeTab === "arch"
+              tabColor: root.purpleColor
               urgentBadge: false
               onClicked: root.activeTab = "arch"
             }
@@ -673,8 +853,8 @@ Panel {
                   width: parent.width
                   implicitHeight: stackRow.implicitHeight + Style.space(10)
                   radius: Style.cornerRadius
-                  color: Style.hoverFillFor(root.foreground, root.accent)
-                  borderSpec: Border.controlSpec("normal", root.accent, root.accent)
+                  color: Util.alpha(root.purpleColor, 0.10)
+                  borderSpec: Border.controlSpec("normal", root.purpleColor, root.purpleColor)
 
                   RowLayout {
                     id: stackRow
@@ -698,21 +878,23 @@ Panel {
 
                     PillBadge {
                       label: modelData.running + "/" + modelData.total + " up"
-                      badgeColor: modelData.running > 0 ? root.accent : root.dim
+                      badgeColor: modelData.running === modelData.total
+                        ? root.okColor
+                        : (modelData.running > 0 ? root.warnColor : root.dim)
                     }
 
                     ActionPill {
-                      visible: modelData.running < modelData.total
+                      visible: modelData.startIds && modelData.startIds.length > 0
                       label: "Start Stack"
-                      tintColor: root.accent
-                      onClicked: devdock.composeStackAction("start", modelData.project)
+                      tintColor: root.okColor
+                      onClicked: devdock.composeStackAction("start", modelData.project, modelData.startIds)
                     }
 
                     ActionPill {
-                      visible: modelData.running > 0
+                      visible: modelData.stopIds && modelData.stopIds.length > 0
                       label: "Stop Stack"
-                      tintColor: root.urgent
-                      onClicked: devdock.composeStackAction("stop", modelData.project)
+                      tintColor: root.dangerColor
+                      onClicked: devdock.composeStackAction("stop", modelData.project, modelData.stopIds)
                     }
                   }
                 }
@@ -780,7 +962,7 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     text: "󰈙 " + devdock.logContainerName
-                    color: root.foreground
+                    color: root.cyanColor
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     font.bold: true
@@ -790,7 +972,7 @@ Panel {
 
                   ActionPill {
                     label: devdock.logAutoRefresh ? "Live ●" : "Paused"
-                    tintColor: devdock.logAutoRefresh ? root.accent : root.dim
+                    tintColor: devdock.logAutoRefresh ? root.okColor : root.warnColor
                     onClicked: devdock.logAutoRefresh = !devdock.logAutoRefresh
                   }
 
@@ -809,7 +991,7 @@ Panel {
                     foreground: root.foreground
                     hoverColor: root.accent
                     fontFamily: root.fontFamily
-                    onClicked: devdock.copyText(devdock.logText, devdock.logContainerName + " logs")
+                    onClicked: devdock.copyContainerLogs(devdock.logContainerId, devdock.logContainerName)
                   }
 
                   PanelActionButton {
@@ -909,8 +1091,17 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "↓ " + Model.formatRate(devdock.rxRateBps) + "   ↑ " + Model.formatRate(devdock.txRateBps)
-                    color: root.accent
+                    text: "↓ " + Model.formatRate(devdock.rxRateBps)
+                    color: root.cyanColor
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "↑ " + Model.formatRate(devdock.txRateBps)
+                    color: root.purpleColor
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     font.bold: true
@@ -940,7 +1131,11 @@ Panel {
                       required property var modelData
                       visible: modelData.rxBytes > 0 || modelData.txBytes > 0 || modelData.kind === "wifi" || modelData.kind === "vpn"
                       label: modelData.name + " ↓" + Model.formatBytes(modelData.rxBytes) + " ↑" + Model.formatBytes(modelData.txBytes)
-                      badgeColor: modelData.kind === "wifi" || modelData.kind === "eth" || modelData.kind === "vpn" ? root.foreground : root.dim
+                      badgeColor: modelData.kind === "wifi" || modelData.kind === "eth"
+                        ? root.okColor
+                        : (modelData.kind === "vpn"
+                          ? root.purpleColor
+                          : (modelData.kind === "docker" ? root.infoColor : root.dim))
                     }
                   }
                 }
@@ -1034,8 +1229,8 @@ Panel {
                           ? (devdock.security.passCount + "/" + devdock.security.checks.length + " · " + devdock.security.warnCount + " WARN")
                           : (devdock.security.passCount + "/" + devdock.security.checks.length + " PASS"))
                       badgeColor: devdock.security.failCount > 0
-                        ? root.urgent
-                        : (devdock.security.warnCount > 0 ? root.urgent : root.accent)
+                        ? root.dangerColor
+                        : (devdock.security.warnCount > 0 ? root.warnColor : root.okColor)
                     }
 
                     Item { Layout.fillWidth: true }
@@ -1211,8 +1406,8 @@ Panel {
               width: parent.width
               implicitHeight: archBannerCol.implicitHeight + Style.space(12)
               radius: Style.cornerRadius
-              color: Style.selectedFillFor(root.foreground, root.accent)
-              borderSpec: Border.controlSpec("selected", root.foreground, root.accent)
+              color: Util.alpha(root.purpleColor, 0.12)
+              borderSpec: Border.controlSpec("selected", root.purpleColor, root.cyanColor)
 
               Column {
                 id: archBannerCol
@@ -1229,7 +1424,7 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     text: "ARCH LINUX · LIVE OS STACK"
-                    color: root.accent
+                    color: root.cyanColor
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: true
@@ -1240,7 +1435,7 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     text: "up " + Model.formatUptime(devdock.arch.uptimeSec)
-                    color: root.dim
+                    color: root.okColor
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                   }
@@ -1266,6 +1461,7 @@ Panel {
               width: parent.width
               layerId: "hw"
               layerNum: "1"
+              layerColor: root.infoColor
               title: "SILICON & STORAGE"
               summary: (devdock.arch.gpuDriver || "gpu") + " · " + (devdock.arch.storageChain || "block")
               badge: devdock.arch.cpuGovernor || ""
@@ -1285,6 +1481,7 @@ Panel {
               width: parent.width
               layerId: "kernel"
               layerNum: "2"
+              layerColor: root.purpleColor
               title: "LINUX KERNEL"
               summary: (devdock.arch.kernelRelease || "linux") + " · " + (devdock.arch.kernelPreempt || "SMP")
               badge: devdock.arch.tainted ? "TAINTED" : (devdock.arch.modulesCount + " mods")
@@ -1304,6 +1501,7 @@ Panel {
               width: parent.width
               layerId: "init"
               layerNum: "3"
+              layerColor: root.okColor
               title: "INIT & CGROUP V2"
               summary: (devdock.arch.initComm || "systemd") + " (PID 1) · " + devdock.arch.processCount + " live tasks"
               badge: devdock.services.failedCount > 0 ? ("!" + devdock.services.failedCount + " fail") : "healthy"
@@ -1323,6 +1521,7 @@ Panel {
               width: parent.width
               layerId: "session"
               layerNum: "4"
+              layerColor: root.cyanColor
               title: "WAYLAND & OMARCHY"
               summary: (devdock.arch.compositor || "Hyprland") + " (" + Model.formatMem(devdock.arch.compositorMemMb) + ") · " + (devdock.arch.audioEngine || "PipeWire")
               badge: (devdock.arch.displays ? devdock.arch.displays.length : 0) + " disp"
@@ -1350,6 +1549,7 @@ Panel {
               width: parent.width
               layerId: "fabrics"
               layerNum: "5"
+              layerColor: root.warnColor
               title: "NETWORK & CONTAINER FABRICS"
               summary: "NIC → UFW → " + (devdock.containers.available ? (devdock.containers.engine + " bridges") : "host stack")
               badge: (devdock.traffic.ifaces ? devdock.traffic.ifaces.length : 0) + " ifaces"
@@ -1378,10 +1578,10 @@ Panel {
               width: parent.width
               implicitHeight: wlCol.implicitHeight + Style.space(12)
               radius: Style.cornerRadius
-              color: isOpen ? Style.selectedFillFor(root.foreground, root.accent) : "transparent"
+              color: isOpen ? Util.alpha(root.purpleColor, 0.11) : "transparent"
               borderSpec: isOpen
-                ? Border.controlSpec("selected", root.foreground, root.accent)
-                : Border.controlSpec("normal", Qt.darker(root.foreground, 2.2), root.accent)
+                ? Border.controlSpec("selected", root.purpleColor, root.purpleColor)
+                : Border.controlSpec("normal", Qt.darker(root.foreground, 2.2), root.purpleColor)
 
               Column {
                 id: wlCol
@@ -1407,7 +1607,7 @@ Panel {
                     anchors.right: parent.right
                     spacing: Style.space(6)
 
-                    PillBadge { label: "6"; badgeColor: root.accent }
+                    PillBadge { label: "6"; badgeColor: root.purpleColor }
 
                     ColumnLayout {
                       Layout.fillWidth: true
@@ -1436,7 +1636,9 @@ Panel {
 
                     PillBadge {
                       label: "RAM " + Number(devdock.host.memPct || 0) + "%"
-                      badgeColor: Number(devdock.host.memPct || 0) >= 85 ? root.urgent : root.accent
+                      badgeColor: Number(devdock.host.memPct || 0) >= 85
+                        ? root.dangerColor
+                        : (Number(devdock.host.memPct || 0) >= 65 ? root.warnColor : root.okColor)
                     }
                   }
                 }
@@ -1453,6 +1655,9 @@ Panel {
                       readonly property real pct: devdock.host.memTotalGb > 0
                         ? Math.min(1.0, (modelData.memMb / 1024.0) / devdock.host.memTotalGb)
                         : 0.1
+                      readonly property color barColor: pct > 0.18
+                        ? root.dangerColor
+                        : (pct > 0.10 ? root.warnColor : (pct > 0.04 ? root.cyanColor : root.okColor))
                       width: parent.width
                       spacing: Style.space(2)
 
@@ -1473,7 +1678,7 @@ Panel {
                         Text {
                           textFormat: Text.PlainText
                           text: Model.formatMem(modelData.memMb)
-                          color: root.accent
+                          color: parent.parent.barColor
                           font.family: root.fontFamily
                           font.pixelSize: Math.max(10, Style.font.caption - 1)
                           font.bold: true
@@ -1490,7 +1695,7 @@ Panel {
                           width: Math.max(Style.space(8), parent.width * parent.parent.pct)
                           height: parent.height
                           radius: parent.radius
-                          color: parent.parent.pct > 0.20 ? root.urgent : root.accent
+                          color: parent.parent.barColor
                         }
                       }
                     }
@@ -1546,8 +1751,8 @@ Panel {
     implicitWidth: pillText.implicitWidth + Style.space(8)
     implicitHeight: pillText.implicitHeight + Style.space(3)
     radius: Style.cornerRadius
-    color: "transparent"
-    borderSpec: Border.controlSpec("normal", pill.badgeColor, pill.badgeColor)
+    color: Util.alpha(pill.badgeColor, 0.13)
+    borderSpec: Border.controlSpec("normal", Util.alpha(pill.badgeColor, 0.55), pill.badgeColor)
 
     Text {
       id: pillText
@@ -1563,12 +1768,13 @@ Panel {
   component CopyChip: BorderSurface {
     id: chip
     property string label: ""
+    property color chipColor: root.dim
     signal clicked()
     implicitWidth: chipText.implicitWidth + Style.space(10)
     implicitHeight: chipText.implicitHeight + Style.space(5)
     radius: Style.cornerRadius
-    color: chipMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accent) : "transparent"
-    borderSpec: Border.controlSpec(chipMouse.containsMouse ? "hover-cursor" : "normal", root.foreground, root.accent)
+    color: chipMouse.containsMouse ? Util.alpha(chip.chipColor, 0.20) : Util.alpha(chip.chipColor, 0.09)
+    borderSpec: Border.controlSpec(chipMouse.containsMouse ? "hover-cursor" : "normal", Util.alpha(chip.chipColor, 0.50), chip.chipColor)
 
     Behavior on color { ColorAnimation { duration: Style.duration(80) } }
 
@@ -1577,7 +1783,7 @@ Panel {
       textFormat: Text.PlainText
       anchors.centerIn: parent
       text: chip.label
-      color: root.dim
+      color: chip.chipColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
     }
@@ -1599,8 +1805,8 @@ Panel {
     implicitWidth: apillText.implicitWidth + Style.space(12)
     implicitHeight: apillText.implicitHeight + Style.space(6)
     radius: Style.cornerRadius
-    color: apillMouse.containsMouse ? Style.hoverFillFor(tintColor, tintColor) : "transparent"
-    borderSpec: Border.controlSpec("normal", tintColor, tintColor)
+    color: apillMouse.containsMouse ? Util.alpha(tintColor, 0.24) : Util.alpha(tintColor, 0.11)
+    borderSpec: Border.controlSpec("normal", Util.alpha(tintColor, 0.65), tintColor)
 
     Behavior on color { ColorAnimation { duration: Style.duration(80) } }
 
@@ -1630,16 +1836,17 @@ Panel {
     property string badge: ""
     property bool active: false
     property bool urgentBadge: false
+    property color tabColor: root.accent
     signal clicked()
 
     implicitHeight: tabRow.implicitHeight + Style.space(10)
     radius: Style.cornerRadius
     color: tabBtn.active
-      ? Style.selectedFillFor(root.foreground, root.accent)
-      : (tabMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accent) : "transparent")
+      ? Util.alpha(tabBtn.urgentBadge ? root.dangerColor : tabBtn.tabColor, 0.16)
+      : (tabMouse.containsMouse ? Style.hoverFillFor(root.foreground, tabBtn.tabColor) : "transparent")
     borderSpec: tabBtn.active
-      ? Border.controlSpec("selected", root.foreground, root.accent)
-      : Border.controlSpec("normal", root.dim, root.accent)
+      ? Border.controlSpec("selected", tabBtn.urgentBadge ? root.dangerColor : tabBtn.tabColor, tabBtn.tabColor)
+      : Border.controlSpec("normal", Qt.darker(root.foreground, 2.2), tabBtn.tabColor)
 
     Behavior on color { ColorAnimation { duration: Style.duration(80) } }
 
@@ -1661,7 +1868,7 @@ Panel {
         textFormat: Text.PlainText
         visible: tabBtn.badge !== ""
         text: tabBtn.badge
-        color: tabBtn.urgentBadge ? root.urgent : (tabBtn.active ? root.accent : root.dim)
+        color: tabBtn.urgentBadge ? root.dangerColor : (tabBtn.active ? tabBtn.tabColor : root.dim)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: tabBtn.urgentBadge || tabBtn.active
@@ -1709,13 +1916,16 @@ Panel {
       anchors.rightMargin: Style.space(6)
       spacing: Style.space(8)
 
-      // Port pill
+      // Port pill (category-coded: blue for web servers, purple for data/brokers/AI, dim for system)
       BorderSurface {
+        readonly property color portTint: prow.item && prow.item.category === "web"
+          ? root.infoColor
+          : (prow.item && prow.item.category === "data" ? root.purpleColor : root.dim)
         implicitWidth: Math.max(Style.space(52), portNumText.implicitWidth + Style.space(10))
         implicitHeight: portNumText.implicitHeight + Style.space(6)
         radius: Style.cornerRadius
-        color: Style.selectedFillFor(root.foreground, root.accent)
-        borderSpec: Border.none()
+        color: Util.alpha(portTint, 0.14)
+        borderSpec: Border.controlSpec("normal", Util.alpha(portTint, 0.45), portTint)
         Layout.alignment: Qt.AlignVCenter
 
         Text {
@@ -1723,7 +1933,7 @@ Panel {
           textFormat: Text.PlainText
           anchors.centerIn: parent
           text: ":" + (prow.item ? prow.item.port : "")
-          color: root.accent
+          color: parent.portTint
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
           font.bold: true
@@ -1752,20 +1962,20 @@ Panel {
           PillBadge {
             visible: prow.item && String(prow.item.gitBranch || "") !== ""
             label: "󰘬 " + (prow.item ? String(prow.item.gitBranch || "") : "")
-            badgeColor: root.accent
+            badgeColor: root.purpleColor
           }
 
           PillBadge {
             visible: prow.item && prow.item.exposedLan === true
             label: "LAN"
-            badgeColor: root.urgent
+            badgeColor: root.dangerColor
           }
 
           PillBadge {
             readonly property var probeRes: prow.item ? devdock.probeFor(prow.item.port) : null
             visible: probeRes !== null
             label: probeRes ? (probeRes.status + " · " + Number(probeRes.ms || 0).toFixed(1) + "ms") : ""
-            badgeColor: probeRes && probeRes.ok ? root.accent : root.urgent
+            badgeColor: probeRes && probeRes.ok ? root.okColor : root.dangerColor
           }
         }
 
@@ -1855,8 +2065,8 @@ Panel {
 
     implicitHeight: trowLayout.implicitHeight + Style.space(12)
     radius: Style.cornerRadius
-    color: Style.hoverFillFor(root.foreground, root.accent)
-    borderSpec: Border.controlSpec("normal", root.accent, root.accent)
+    color: Util.alpha(root.cyanColor, 0.10)
+    borderSpec: Border.controlSpec("normal", Util.alpha(root.cyanColor, 0.60), root.cyanColor)
 
     RowLayout {
       id: trowLayout
@@ -1869,7 +2079,7 @@ Panel {
 
       PillBadge {
         label: (trow.tunnel ? String(trow.tunnel.direction || "L") : "L") + " :" + (trow.tunnel ? trow.tunnel.localPort : "")
-        badgeColor: root.accent
+        badgeColor: root.cyanColor
       }
 
       ColumnLayout {
@@ -1973,7 +2183,7 @@ Panel {
       Text {
         textFormat: Text.PlainText
         text: crow.isPending ? "◐" : (crow.running ? "●" : "○")
-        color: (crow.running || crow.isPending) ? root.accent : root.dim
+        color: crow.isPending ? root.warnColor : (crow.running ? root.okColor : root.dim)
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         Layout.alignment: Qt.AlignVCenter
@@ -2001,13 +2211,13 @@ Panel {
           PillBadge {
             visible: crow.isPending
             label: crow.pending + "…"
-            badgeColor: root.accent
+            badgeColor: root.warnColor
           }
 
           PillBadge {
             visible: !crow.isPending && crow.ctr && crow.ctr.ports && crow.ctr.ports.length > 0
             label: crow.ctr && crow.ctr.ports && crow.ctr.ports.length > 0 ? (":" + crow.ctr.ports.join(" :")) : ""
-            badgeColor: crow.running ? root.accent : root.dim
+            badgeColor: crow.running ? root.cyanColor : root.dim
           }
         }
 
@@ -2017,7 +2227,7 @@ Panel {
           text: (crow.ctr ? String(crow.ctr.image || "") : "")
             + " · "
             + (crow.isPending ? (crow.pending + " via unix socket…") : (crow.ctr ? String(crow.ctr.status || "") : ""))
-          color: crow.isPending ? root.accent : root.dim
+          color: crow.isPending ? root.warnColor : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
@@ -2139,7 +2349,7 @@ Panel {
       Text {
         textFormat: Text.PlainText
         text: krow.isCurrent ? "󰄬" : "○"
-        color: krow.isCurrent ? (krow.isProd ? root.urgent : root.accent) : root.dim
+        color: krow.isCurrent ? (krow.isProd ? root.dangerColor : root.okColor) : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
       }
@@ -2282,7 +2492,7 @@ Panel {
       Text {
         textFormat: Text.PlainText
         text: drow.isFailed ? "󰀪" : (drow.isActive ? "●" : "○")
-        color: drow.isFailed ? root.urgent : (drow.isActive ? root.accent : root.dim)
+        color: drow.isFailed ? root.dangerColor : (drow.isActive ? root.okColor : root.dim)
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
       }
@@ -2338,10 +2548,14 @@ Panel {
 
     implicitHeight: srowLayout.implicitHeight + Style.space(8)
     radius: Style.cornerRadius
-    color: srow.isFail ? Util.alpha(root.urgent, 0.14) : "transparent"
+    color: srow.isFail
+      ? Util.alpha(root.dangerColor, 0.14)
+      : (srow.isWarn ? Util.alpha(root.warnColor, 0.10) : "transparent")
     borderSpec: srow.isFail
-      ? Border.controlSpec("normal", root.urgent, root.urgent)
-      : Border.controlSpec("normal", Qt.darker(root.foreground, 2.4), root.accent)
+      ? Border.controlSpec("normal", root.dangerColor, root.dangerColor)
+      : (srow.isWarn
+        ? Border.controlSpec("normal", Util.alpha(root.warnColor, 0.55), root.warnColor)
+        : Border.controlSpec("normal", Qt.darker(root.foreground, 2.4), root.okColor))
 
     RowLayout {
       id: srowLayout
@@ -2355,7 +2569,7 @@ Panel {
       Text {
         textFormat: Text.PlainText
         text: srow.isFail ? "󰀪" : (srow.isWarn ? "▲" : "󰄬")
-        color: srow.isFail ? root.urgent : (srow.isWarn ? root.urgent : root.accent)
+        color: srow.isFail ? root.dangerColor : (srow.isWarn ? root.warnColor : root.okColor)
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
       }
@@ -2470,31 +2684,31 @@ Panel {
           PillBadge {
             visible: tgrow.isCritical
             label: "CRITICAL"
-            badgeColor: root.urgent
+            badgeColor: root.dangerColor
           }
 
           PillBadge {
             visible: !tgrow.isCritical && tgrow.isCleartext
             label: "CLEAR"
-            badgeColor: root.urgent
+            badgeColor: root.warnColor
           }
 
           PillBadge {
             visible: tgrow.group && tgrow.group.internetCount > 0
             label: (tgrow.group ? tgrow.group.internetCount : 0) + " net"
-            badgeColor: root.accent
+            badgeColor: root.cyanColor
           }
 
           PillBadge {
             visible: tgrow.group && tgrow.group.lanCount > 0
             label: (tgrow.group ? tgrow.group.lanCount : 0) + " LAN"
-            badgeColor: root.dim
+            badgeColor: root.purpleColor
           }
 
           PillBadge {
             visible: tgrow.group && tgrow.group.inboundCount > 0
             label: (tgrow.group ? tgrow.group.inboundCount : 0) + " in"
-            badgeColor: root.urgent
+            badgeColor: root.warnColor
           }
         }
       }
@@ -2552,7 +2766,7 @@ Panel {
             Text {
               textFormat: Text.PlainText
               text: modelData.direction === "in" ? "↙" : "↗"
-              color: modelData.direction === "in" ? root.urgent : root.accent
+              color: modelData.direction === "in" ? root.warnColor : root.okColor
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.bold: true
@@ -2563,7 +2777,9 @@ Panel {
               Layout.fillWidth: true
               text: modelData.remoteIp + ":" + modelData.remotePort
                 + (rdnsName !== "" ? (" (" + rdnsName + ")") : "")
-              color: modelData.risk === "critical" || modelData.risk === "cleartext" ? root.urgent : root.foreground
+              color: modelData.risk === "critical"
+                ? root.dangerColor
+                : (modelData.risk === "cleartext" ? root.warnColor : root.foreground)
               font.family: root.fontFamily
               font.pixelSize: Math.max(10, Style.font.caption - 1)
               elide: Text.ElideRight
@@ -2571,7 +2787,11 @@ Panel {
 
             PillBadge {
               label: String(modelData.service || "TCP")
-              badgeColor: modelData.risk === "safe" ? root.dim : root.urgent
+              badgeColor: modelData.risk === "critical"
+                ? root.dangerColor
+                : (modelData.risk === "cleartext"
+                  ? root.warnColor
+                  : (String(modelData.service || "") === "HTTPS" ? root.okColor : root.infoColor))
             }
 
             PanelActionButton {
@@ -2617,17 +2837,18 @@ Panel {
     property string summary: ""
     property string badge: ""
     property bool urgentBadge: false
+    property color layerColor: root.accent
     property var details: []
     readonly property bool isOpen: root.expandedArchLayer === layerId && layerId !== ""
 
     implicitHeight: alCol.implicitHeight + Style.space(12)
     radius: Style.cornerRadius
     color: alayer.isOpen
-      ? Style.selectedFillFor(root.foreground, root.accent)
-      : (alMouse.containsMouse ? Style.hoverFillFor(root.foreground, root.accent) : "transparent")
+      ? Util.alpha(alayer.layerColor, 0.11)
+      : (alMouse.containsMouse ? Util.alpha(alayer.layerColor, 0.08) : "transparent")
     borderSpec: alayer.isOpen
-      ? Border.controlSpec("selected", root.foreground, root.accent)
-      : Border.controlSpec("normal", Qt.darker(root.foreground, 2.2), root.accent)
+      ? Border.controlSpec("selected", alayer.layerColor, alayer.layerColor)
+      : Border.controlSpec("normal", Qt.darker(root.foreground, 2.2), alayer.layerColor)
 
     Behavior on color { ColorAnimation { duration: Style.duration(70) } }
 
@@ -2659,7 +2880,7 @@ Panel {
 
           PillBadge {
             label: alayer.layerNum
-            badgeColor: alayer.urgentBadge ? root.urgent : root.accent
+            badgeColor: alayer.urgentBadge ? root.dangerColor : alayer.layerColor
           }
 
           ColumnLayout {
@@ -2689,7 +2910,7 @@ Panel {
           PillBadge {
             visible: alayer.badge !== ""
             label: alayer.badge
-            badgeColor: alayer.urgentBadge ? root.urgent : root.dim
+            badgeColor: alayer.urgentBadge ? root.dangerColor : alayer.layerColor
           }
         }
       }
