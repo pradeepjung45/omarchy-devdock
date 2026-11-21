@@ -350,8 +350,29 @@ fn enumerate_btrfs_backing_devices(primary_dev: &str) -> Option<Vec<String>> {
     None
 }
 
-pub fn is_crypt_dm_uuid(uuid: &str) -> bool {
-    uuid.trim().starts_with("CRYPT-")
+/// Identify explicitly encryption-capable dm-crypt UUID prefixes (libcryptsetup
+/// convention). Integrity-only `CRYPT-` targets such as `CRYPT-VERITY-` and
+/// `CRYPT-INTEGRITY-` return `None` so traversal continues into their backing
+/// devices rather than misreporting plaintext storage as encrypted.
+pub fn classify_dm_encryption_uuid(uuid: &str) -> Option<&'static str> {
+    let u = uuid.trim();
+    if u.starts_with("CRYPT-LUKS2-") {
+        Some("LUKS2")
+    } else if u.starts_with("CRYPT-LUKS1-") {
+        Some("LUKS1")
+    } else if u.starts_with("CRYPT-PLAIN-") {
+        Some("dm-crypt-plain")
+    } else if u.starts_with("CRYPT-TCRYPT-") {
+        Some("TCRYPT")
+    } else if u.starts_with("CRYPT-BITLK-") {
+        Some("BITLK")
+    } else if u.starts_with("CRYPT-LOOPAES-") {
+        Some("LOOPAES")
+    } else if u.starts_with("CRYPT-FVAULT2-") {
+        Some("FVAULT2")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -428,15 +449,8 @@ where
             return;
         };
         if let Some(uuid) = &node.dm_uuid
-            && is_crypt_dm_uuid(uuid)
+            && let Some(kind) = classify_dm_encryption_uuid(uuid)
         {
-            let kind = if uuid.starts_with("CRYPT-LUKS2-") {
-                "LUKS2"
-            } else if uuid.starts_with("CRYPT-LUKS1-") {
-                "LUKS1"
-            } else {
-                "dm-crypt"
-            };
             if !encrypted.iter().any(|(d, _)| d == dev) {
                 encrypted.push((dev.to_string(), kind.to_string()));
             }
@@ -819,8 +833,58 @@ mod tests {
             extract_root_mount_info(mi),
             Some(("btrfs".into(), "0:27".into(), "/dev/mapper/root".into()))
         );
-        assert!(is_crypt_dm_uuid("CRYPT-LUKS2-6402632d2ba5443f8ff4043762fb3bcf-root\n"));
-        assert!(!is_crypt_dm_uuid("LVM-abcd1234"));
+        assert_eq!(
+            classify_dm_encryption_uuid("CRYPT-LUKS2-6402632d2ba5443f8ff4043762fb3bcf-root\n"),
+            Some("LUKS2")
+        );
+        assert_eq!(classify_dm_encryption_uuid("CRYPT-PLAIN-swap"), Some("dm-crypt-plain"));
+        assert_eq!(classify_dm_encryption_uuid("CRYPT-VERITY-1234-root"), None);
+        assert_eq!(classify_dm_encryption_uuid("CRYPT-INTEGRITY-1234-root"), None);
+        assert_eq!(classify_dm_encryption_uuid("LVM-abcd1234"), None);
+
+        // Integrity-only dm-verity on plaintext storage MUST NOT pass (continues into slaves)
+        let verity_plaintext = evaluate_block_encryption(&["dm-0".into()], |dev| match dev {
+            "dm-0" => Some(BlockNode {
+                dm_uuid: Some("CRYPT-VERITY-deadbeef-verityroot".into()),
+                slaves: Some(vec!["nvme0n1p2".into()]),
+            }),
+            "nvme0n1p2" => Some(BlockNode {
+                dm_uuid: None,
+                slaves: Some(vec![]),
+            }),
+            _ => None,
+        });
+        assert_eq!(verity_plaintext.status, "warn");
+        assert!(verity_plaintext.detail.contains("nvme0n1p2"));
+
+        // Integrity-only dm-integrity on plaintext storage MUST NOT pass
+        let integrity_plaintext = evaluate_block_encryption(&["dm-0".into()], |dev| match dev {
+            "dm-0" => Some(BlockNode {
+                dm_uuid: Some("CRYPT-INTEGRITY-abcd-introot".into()),
+                slaves: Some(vec!["sda2".into()]),
+            }),
+            "sda2" => Some(BlockNode {
+                dm_uuid: None,
+                slaves: Some(vec![]),
+            }),
+            _ => None,
+        });
+        assert_eq!(integrity_plaintext.status, "warn");
+
+        // dm-verity stacked over LUKS2 passes ONLY because its backing device is LUKS2
+        let verity_over_luks = evaluate_block_encryption(&["dm-1".into()], |dev| match dev {
+            "dm-1" => Some(BlockNode {
+                dm_uuid: Some("CRYPT-VERITY-deadbeef-verityroot".into()),
+                slaves: Some(vec!["dm-0".into()]),
+            }),
+            "dm-0" => Some(BlockNode {
+                dm_uuid: Some("CRYPT-LUKS2-6402632d-cryptroot".into()),
+                slaves: Some(vec!["nvme0n1p2".into()]),
+            }),
+            _ => None,
+        });
+        assert_eq!(verity_over_luks.status, "pass");
+        assert!(verity_over_luks.detail.contains("dm-0:LUKS2"));
 
         // Mixed LVM volume: one encrypted slave (dm-0) + one raw slave (nvme1n1p1) -> FAIL!
         let mixed = evaluate_block_encryption(&["dm-2".into()], |dev| match dev {

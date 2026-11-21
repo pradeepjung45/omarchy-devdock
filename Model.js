@@ -1,6 +1,6 @@
 .pragma library
 
-var EXPECTED_SOURCE_SHA256 = "b41d890e235db541294b1c59c790ea8a8e70379d1528985d16518f81035a60ec"
+var EXPECTED_SOURCE_SHA256 = "57317f3a07918c1e099cb9dabb94a783586c8c5091ec77a471ee00a83e6c657c"
 
 function emptySnapshot() {
   return {
